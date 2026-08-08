@@ -36,51 +36,93 @@ class AgentSpec:
     display_name: str
     description: str
     skills: dict[str, SkillSpec]
+    search_hint: str = ""
 
 
 def review_prompt(display_name: str, focus: str) -> str:
+    return _review_prompt(display_name, focus)
+
+
+def _review_prompt(display_name: str, focus: str) -> str:
     return (
         f"You are the {display_name} Agent on a hackathon idea review panel. {focus} "
-        "Evaluate the idea using only the information provided. Ground every point in the "
-        "team's stated time, team size, goals, skills, and constraints. Do not give generic "
-        "startup or long-term product advice. Do not recommend post-MVP backlog work unless it "
-        "directly improves the hackathon demo. Prefer concrete workflow changes, scope cuts, "
-        "or implementation moves the team can act on immediately.\n\n"
+        "Evaluate the idea using the provided research fact sheet and the team's stated time, "
+        "team size, goals, skills, and constraints.\n\n"
+        "FACTUAL DISCIPLINE (mandatory):\n"
+        "- Every strength, weakness, and suggestion must be anchored in a specific fact, "
+        "statistic, or source from the research brief. Never state unverified numbers as facts.\n"
+        "- If a point is your own inference rather than a sourced fact, mark it explicitly as an "
+        "'Assumption' in the text.\n"
+        "- Prefer hard signals: figures, dates, named libraries/APIs, concrete failure modes.\n"
+        "- Do not give generic startup or long-term product advice. Prefer concrete workflow "
+        "changes, scope cuts, or implementation moves the team can act on immediately.\n\n"
         "Output requirements:\n"
         "- Set the 'agent' field exactly as instructed.\n"
         "- Use a 0-10 score where 5 means viable but unproven for a hackathon.\n"
-        "- Provide 2-4 strengths, 2-4 weaknesses, and 3-5 suggestions.\n"
-        "- Each suggestion must be specific, actionable, and framed as a next-step decision or "
-        "workflow move. Good examples: narrow the demo to one input path, replace custom ML with "
-        "an API, assign one teammate to demo prep, add a fallback if OCR fails.\n"
-        "- Avoid vague suggestions like 'do market research', 'make it more user-friendly', or "
-        "'use better tools' unless you tie them to a concrete hackathon action.\n"
+        "- Provide 2-4 strengths, 2-4 weaknesses, and 3-5 suggestions, each tied to a fact.\n"
+        "- 'key_facts': list the 2-5 concrete facts/figures you relied on, in the same words as "
+        "the brief.\n"
+        "- 'sources': list the source label for each key fact.\n"
         "- Keep confidence aligned with how constrained or uncertain the plan is.\n\n"
         "Return ONLY valid JSON."
     )
 
 
 def debate_prompt(display_name: str) -> str:
+    return _debate_prompt(display_name)
+
+
+def _debate_prompt(display_name: str) -> str:
     return (
-        f"You are the {display_name} Agent. Below is your original review followed by the "
-        "reviews from every other agent on the panel. In this structured debate, respond only "
-        "to the 1-3 most important claims that materially affect scope, feasibility, judging "
-        "odds, architecture, or demo quality. Prefer concrete rebuttals over generic opinions. "
-        "If another agent is right, concede clearly. Do not repeat your whole review. Do not "
-        "argue both sides of the same issue. Use 'reply_to' for the other agent's name and "
-        "'stance' of 'Agree' or 'Disagree'. Make each argument concise and evidence-based. "
+        f"You are the {display_name} Agent. Below is your original review (with its research "
+        "facts) followed by the reviews of every other agent on the panel. This is a hard, "
+        "evidence-first debate about which claims survive scrutiny.\n\n"
+        "RULES - HARDER BUT FAIR:\n"
+        "- Respond to the 1-3 most consequential claims, and attack the WEAKEST, most "
+        "unsupported claim in each peer review.\n"
+        "- EVERY reply must be anchored to a specific fact, figure, or source from the research "
+        "brief or the original reviews. Quote the claim you are disputing.\n"
+        "- Explicitly flag unsupported claims: label them 'unsupported claim' and demand a "
+        "citation. Do not accept an assertion merely because it sounds reasonable.\n"
+        "- Push back with evidence rather than opinion. Do not argue both sides of the same "
+        "point.\n"
+        "- Concede only when a peer cites a stronger, more verifiable fact than yours; state "
+        "exactly which fact changed your mind.\n"
+        "- Use 'reply_to' for the other agent's name and 'stance' of 'Agree' or 'Disagree'.\n"
         "Return ONLY a JSON array of debate replies."
     )
 
 
 def reflect_prompt(display_name: str) -> str:
+    return _reflect_prompt(display_name)
+
+
+def _reflect_prompt(display_name: str) -> str:
     return (
-        f"You are the {display_name} Agent. Below is your original review followed by the full "
-        "debate transcript. Revisit your original evaluation: keep your score, raise or lower "
-        "it, and update your suggestions based only on the strongest arguments from the debate. "
-        "Do not simply merge everyone's advice. Resolve contradictions and keep the final "
-        "suggestions prioritized, deduplicated, and actionable for the hackathon workflow. "
-        "Explain what changed and why. Return ONLY valid JSON."
+        f"You are the {display_name} Agent. Below is your original review (with its key facts) "
+        "plus the full debate transcript, where the hardest evidence-first arguments are "
+        "flagged. Revisit your evaluation in light of the debate.\n\n"
+        "- Keep, raise, or lower your score, and explain the change only in terms of the "
+        "specific cited facts and 'unsupported claim' challenges you heard - not generic "
+        "pressure to change.\n"
+        "- Discard or demote any of your original suggestions whose factual foundation was "
+        "successfully challenged during the debate.\n"
+        "- Final suggestions must remain prioritized, deduplicated, and actionable, each "
+        "traceable to a fact or a fixed data gap.\n"
+        "- State explicitly what changed and which fact drove it.\n"
+        "Return ONLY valid JSON."
+    )
+
+
+def gen_debate_prompt(display_name: str, focus: str) -> str:
+    return (
+        f"You are the {display_name} Agent on the idea generation panel. {focus} Below is your "
+        "own candidate proposal and the proposals from the other panelists. Respond to the 1-3 "
+        "most important differences that decide which idea is strongest for a hackathon. Do NOT "
+        "repeat your whole proposal. EVERY argument MUST reference at least one specific fact or "
+        "data gap from the fact sheet (cite the claim) - never argue from vague generalities. If "
+        "another proposal is stronger, concede clearly. Use 'reply_to' for the other agent's name "
+        "and 'stance' of 'Agree' or 'Disagree'. Return ONLY a JSON array of debate replies."
     )
 
 

@@ -34,4 +34,5 @@ SPEC = AgentSpec(
     display_name="Technical",
     description="Evaluates the technical approach and stack for a hackathon idea.",
     skills=SKILLS,
+    search_hint="implementation libraries, free-tier APIs, integration risk, accuracy benchmarks",
 )

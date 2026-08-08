@@ -33,4 +33,5 @@ SPEC = AgentSpec(
     display_name="Skeptic",
     description="Stress-tests a hackathon idea for flaws and failure risks.",
     skills=SKILLS,
+    search_hint="failure modes, limitations, statistical risks, accuracy gaps, competition",
 )

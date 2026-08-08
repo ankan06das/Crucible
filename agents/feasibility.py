@@ -33,4 +33,5 @@ SPEC = AgentSpec(
     display_name="Feasibility",
     description="Evaluates whether a hackathon idea can be built in time by a small team.",
     skills=SKILLS,
+    search_hint="build timeline, scope, similar hackathon implementations, free-tier tooling",
 )

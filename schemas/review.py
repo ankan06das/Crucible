@@ -12,6 +12,14 @@ class AgentReview(BaseModel):
     confidence: float = Field(
         ge=0, le=1, description="Confidence in this review from 0.0 to 1.0."
     )
+    key_facts: list[str] = Field(
+        default_factory=list,
+        description="The 2-5 concrete facts/figures the review relies on.",
+    )
+    sources: list[str] = Field(
+        default_factory=list,
+        description="The source label for each key fact.",
+    )
 
     @field_validator("score", mode="before")
     @classmethod
@@ -20,7 +28,7 @@ class AgentReview(BaseModel):
             return round(value)
         return value
 
-    @field_validator("strengths", "weaknesses", "suggestions", mode="before")
+    @field_validator("strengths", "weaknesses", "suggestions", "key_facts", "sources", mode="before")
     @classmethod
     def _coerce_string_lists(cls, value):
         if not isinstance(value, list):

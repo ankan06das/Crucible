@@ -33,4 +33,5 @@ SPEC = AgentSpec(
     display_name="Impact",
     description="Evaluates the user and market impact of a hackathon idea.",
     skills=SKILLS,
+    search_hint="user pain, market size, adoption statistics, population affected",
 )

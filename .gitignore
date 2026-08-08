@@ -12,3 +12,6 @@ graphify-out/
 
 #opencode
 .opencode
+
+#log files
+generator_pipeline.log

@@ -33,4 +33,5 @@ SPEC = AgentSpec(
     display_name="Innovation",
     description="Evaluates the novelty and originality of a hackathon idea.",
     skills=SKILLS,
+    search_hint="novelty, differentiation, existing competing solutions, market gaps",
 )

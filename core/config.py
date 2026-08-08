@@ -10,7 +10,9 @@ class LLMSettings(BaseSettings):
     api_key: str = ""
 
     max_retries: int = 5
-    
+
+    web_research_enabled: bool = True
+
     model_config = {"env_file": ".env", "extra": "ignore"}
 
     @model_validator(mode="after")
