@@ -107,6 +107,57 @@ def _unpack_proposals(proposals: dict[str, object]) -> list[CandidateProposal]:
     return candidates
 
 
+async def generate_candidates(
+    app: "FastAPI", req: GenerationRequest, llm: LLM | None = None
+) -> dict[str, object]:
+    llm = llm or LLM()
+    cards = mount(app, llm=llm)
+    panel = A2APanelClient(app, cards)
+    try:
+        _print_phase("FACTUAL DATA COLLECTION")
+        brief = await research_topic(req.topic, req.urls, llm)
+        _print_step("FACT SHEET", brief)
+        fact_sheet = _format_fact_sheet(brief)
+        context = _format_context(req)
+
+        # Parallel independent generation (groupthink-free)
+        proposal_tasks = {}
+        for spec in GENERATOR_SPECS:
+            skill, schema = GEN_SKILLS[spec.name]
+            proposal_tasks[spec.name] = asyncio.create_task(
+                panel.ask(spec.name, f"{fact_sheet}\n\n{context}", skill, schema)
+            )
+        proposals = await _run_tasks("IDEA PROPOSALS", proposal_tasks, show_results=True)
+
+        candidates = _unpack_proposals(proposals)
+        candidate_board = _format_candidates(candidates)
+
+        # Generation debate: everyone argues over the pooled candidate board by title
+        debate_tasks = {}
+        for spec in GENERATOR_SPECS:
+            prompt = (
+                f"{fact_sheet}\n\n{candidate_board}\n\n"
+                f"Your full output:\n{proposals[spec.name].model_dump_json(indent=2)}\n\n"
+                f"Debate the candidate ideas by title. Ground every argument in a fact or data "
+                f"gap and defend or attack the strongest candidates for a hackathon."
+            )
+            debate_tasks[spec.name] = asyncio.create_task(
+                panel.ask(spec.name, prompt, "debate", DebateRound)
+            )
+        debates = await _run_tasks("GENERATION DEBATE", debate_tasks, show_results=True)
+
+        # Return data to store in projects
+        return {
+            "research": brief.model_dump() if brief else None,
+            "candidates": [c.model_dump() for c in candidates],
+            "proposals": {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in proposals.items()},
+            "debates": {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in debates.items()},
+            "context": context
+        }
+    finally:
+        await panel.close()
+
+
 async def generate_idea(
     app: "FastAPI", req: GenerationRequest, llm: LLM | None = None
 ) -> GenerationResult:

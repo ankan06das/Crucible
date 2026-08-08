@@ -56,6 +56,19 @@ export default function App() {
   const [contactMsg, setContactMsg] = useState("");
   const [contactSuccess, setContactSuccess] = useState("");
 
+  // Collaborations, Invitations & Chat follow-ups states
+  const [collaboratedProjects, setCollaboratedProjects] = useState([]);
+  const [invitations, setInvitations] = useState([]);
+  const [collaborators, setCollaborators] = useState([]);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteStatus, setInviteStatus] = useState("");
+  const [selectedAgentForChat, setSelectedAgentForChat] = useState("skeptic");
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [showCollabModal, setShowCollabModal] = useState(false);
+  const [candidateSelectionLoading, setCandidateSelectionLoading] = useState(false);
+  const [activeTabSubView, setActiveTabSubView] = useState("overview"); // overview | reviews | debates | chat | candidates
+
   useEffect(() => {
     const root = window.document.documentElement;
     if (theme === "dark") {
@@ -76,6 +89,8 @@ export default function App() {
   useEffect(() => {
     if (token) {
       loadProjects();
+      loadCollaboratedProjects();
+      loadInvitations();
     }
   }, [token]);
 
@@ -102,6 +117,158 @@ export default function App() {
     }
   };
 
+  const loadCollaboratedProjects = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/projects/collaborations`, {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setCollaboratedProjects(data);
+      }
+    } catch (err) {
+      console.error("Error loading collaborated projects", err);
+    }
+  };
+
+  const loadInvitations = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/invitations`, {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setInvitations(data);
+      }
+    } catch (err) {
+      console.error("Error loading invitations", err);
+    }
+  };
+
+  const respondToInvitation = async (invitationId, response) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/invitations/${invitationId}/respond`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({ response })
+      });
+      if (res.ok) {
+        loadInvitations();
+        loadProjects();
+        loadCollaboratedProjects();
+      } else {
+        const errData = await res.json();
+        alert(errData.detail || "Error responding to invitation");
+      }
+    } catch (err) {
+      console.error("Error responding to invitation", err);
+    }
+  };
+
+  const loadCollaborators = async (projectId) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/projects/${projectId}/collaborators`, {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setCollaborators(data);
+      }
+    } catch (err) {
+      console.error("Error loading collaborators", err);
+    }
+  };
+
+  const inviteCollaborator = async (e) => {
+    e.preventDefault();
+    if (!inviteEmail) return;
+    setInviteStatus("Transmitting uplink invitation...");
+    try {
+      const res = await fetch(`${API_BASE}/api/projects/${activeProject.id}/invite`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({ email: inviteEmail })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setInviteStatus(`[SUCCESS] Invite sent to ${inviteEmail}`);
+        setInviteEmail("");
+        loadCollaborators(activeProject.id);
+      } else {
+        setInviteStatus(`[ERROR] ${data.detail || "Failed to transmit invite"}`);
+      }
+    } catch (err) {
+      setInviteStatus("[ERROR] Connection lost to server");
+    }
+  };
+
+  const selectCandidateIdea = async (candidate) => {
+    setCandidateSelectionLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/projects/${activeProject.id}/select-candidate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({ title: candidate.title, idea: candidate.idea })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        loadProjectDetails(data.project_id);
+      } else {
+        alert("Failed to initialize debate refinement for chosen topic");
+      }
+    } catch (err) {
+      console.error("Error selecting candidate", err);
+    } finally {
+      setCandidateSelectionLoading(false);
+    }
+  };
+
+  const sendAgentMessage = async (e) => {
+    e.preventDefault();
+    if (!chatInput.trim() || chatLoading) return;
+    
+    const userMessage = chatInput;
+    setChatInput("");
+    setChatLoading(true);
+    
+    setChats(prev => [...prev, { sender: username, message: userMessage, created_at: new Date().toISOString() }]);
+    
+    try {
+      const res = await fetch(`${API_BASE}/api/projects/${activeProject.id}/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({ message: userMessage, recipient: selectedAgentForChat })
+      });
+      if (res.ok) {
+        const chatRes = await fetch(`${API_BASE}/api/projects/${activeProject.id}/chats`, {
+          headers: { "Authorization": `Bearer ${token}` }
+        });
+        if (chatRes.ok) {
+          const chatData = await chatRes.json();
+          setChats(chatData);
+        }
+      } else {
+        alert("Failed to reach agent uplink.");
+      }
+    } catch (err) {
+      console.error("Error communicating with agent", err);
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
   const loadProjectDetails = async (projectId) => {
     try {
       const res = await fetch(`${API_BASE}/api/projects/${projectId}`, {
@@ -111,6 +278,7 @@ export default function App() {
         const data = await res.json();
         setActiveProject(data);
         setLoadedResult(data.project_data);
+        loadCollaborators(projectId);
         
         // Load chats
         const chatRes = await fetch(`${API_BASE}/api/projects/${projectId}/chats`, {
@@ -122,6 +290,7 @@ export default function App() {
         }
         
         setActiveTab("dashboard");
+        setActiveTabSubView("overview");
       }
     } catch (err) {
       console.error("Error loading project details", err);
@@ -159,11 +328,12 @@ export default function App() {
     setAuthError("");
     const userVal = e.target.username.value;
     const passVal = e.target.password.value;
+    const emailVal = e.target.email.value;
     try {
       const res = await fetch(`${API_BASE}/api/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: userVal, password: passVal })
+        body: JSON.stringify({ username: userVal, password: passVal, email: emailVal })
       });
       if (res.ok) {
         setAuthMode("login");
@@ -536,6 +706,12 @@ export default function App() {
               <label className="font-code-sm text-label-xs text-on-surface-variant uppercase tracking-wider block">Operator Username</label>
               <input type="text" name="username" required className="w-full bg-[#131313] border border-white/10 text-on-surface p-sm font-code-sm text-code-sm rounded-DEFAULT focus:outline-none focus:border-primary-container focus:ring-1 focus:ring-primary-container transition-all" />
             </div>
+            {authMode === "register" && (
+              <div className="space-y-xs relative scanline">
+                <label className="font-code-sm text-label-xs text-on-surface-variant uppercase tracking-wider block">Operator Email Address</label>
+                <input type="email" name="email" required className="w-full bg-[#131313] border border-white/10 text-on-surface p-sm font-code-sm text-code-sm rounded-DEFAULT focus:outline-none focus:border-primary-container focus:ring-1 focus:ring-primary-container transition-all" />
+              </div>
+            )}
             <div className="space-y-xs relative scanline">
               <label className="font-code-sm text-label-xs text-on-surface-variant uppercase tracking-wider block">Passcode Key</label>
               <input type="password" name="password" required className="w-full bg-[#131313] border border-white/10 text-on-surface p-sm font-code-sm text-code-sm rounded-DEFAULT focus:outline-none focus:border-primary-container focus:ring-1 focus:ring-primary-container transition-all" />
@@ -642,16 +818,61 @@ export default function App() {
                 NEW BRAINSTORM
               </button>
 
-              <div className="flex-1 flex flex-col gap-sm">
-                <div className="font-code-sm text-[10px] text-slate-500 dark:text-on-surface-variant uppercase tracking-wider block mb-xs px-sm select-none font-bold">Saved Projects</div>
-                
-                <div className="flex-1 overflow-y-auto max-h-[35vh] space-y-xs">
-                  {projects.map(proj => (
-                    <a key={proj.id} onClick={() => loadProjectDetails(proj.id)} className={`flex items-center gap-xs px-sm py-xs rounded-DEFAULT transition-all cursor-pointer text-xs truncate max-w-xs font-code-sm ${activeProject?.id === proj.id ? "text-slate-900 dark:text-white bg-slate-100 dark:bg-white/10 border-l-2 border-primary-container font-bold" : "text-slate-500 dark:text-on-surface-variant hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-white/5"}`}>
-                      <span className="material-symbols-outlined text-xs select-none">folder</span>
-                      {proj.name}
-                    </a>
-                  ))}
+              <div className="flex-1 flex flex-col gap-sm overflow-y-auto pr-base">
+                {/* 1. Pending Invitations Section */}
+                {invitations.length > 0 && (
+                  <div className="bg-primary/5 dark:bg-primary-container/10 border border-primary/20 dark:border-primary-container/30 rounded-lg p-sm space-y-sm text-left">
+                    <div className="flex items-center justify-between">
+                      <span className="font-code-sm text-[10px] text-primary dark:text-primary-fixed-dim uppercase tracking-wider font-bold select-none">Uplink Invites</span>
+                      <span className="bg-primary text-white text-[9px] px-xs rounded font-bold">{invitations.length}</span>
+                    </div>
+                    <div className="space-y-xs max-h-[15vh] overflow-y-auto">
+                      {invitations.map(inv => (
+                        <div key={inv.id} className="text-[10px] bg-white dark:bg-black/40 p-xs rounded border border-slate-200 dark:border-white/5 space-y-xs font-code-sm">
+                          <div className="font-bold text-slate-800 dark:text-primary-fixed-dim truncate">{inv.project_name}</div>
+                          <div className="text-slate-500 dark:text-on-surface-variant truncate">From: {inv.sender_name}</div>
+                          <div className="flex gap-xs pt-base">
+                            <button onClick={() => respondToInvitation(inv.id, "accept")} className="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-[2px] rounded text-[9px] uppercase">Accept</button>
+                            <button onClick={() => respondToInvitation(inv.id, "decline")} className="flex-1 bg-slate-500 hover:bg-slate-600 text-white font-bold py-[2px] rounded text-[9px] uppercase">Decline</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 2. My Projects */}
+                <div>
+                  <div className="font-code-sm text-[10px] text-slate-500 dark:text-on-surface-variant uppercase tracking-wider block mb-xs px-sm select-none font-bold text-left">My Projects</div>
+                  <div className="space-y-xs max-h-[22vh] overflow-y-auto pr-xs">
+                    {projects.length === 0 ? (
+                      <div className="text-slate-400 dark:text-on-surface-variant text-[10px] italic px-sm text-left">No owned projects</div>
+                    ) : (
+                      projects.map(proj => (
+                        <a key={proj.id} onClick={() => loadProjectDetails(proj.id)} className={`flex items-center gap-xs px-sm py-xs rounded-DEFAULT transition-all cursor-pointer text-xs truncate max-w-xs font-code-sm ${activeProject?.id === proj.id ? "text-slate-900 dark:text-white bg-slate-100 dark:bg-white/10 border-l-2 border-primary-container font-bold" : "text-slate-500 dark:text-on-surface-variant hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-white/5"}`}>
+                          <span className="material-symbols-outlined text-xs select-none">folder</span>
+                          {proj.name}
+                        </a>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                {/* 3. Collaborations */}
+                <div>
+                  <div className="font-code-sm text-[10px] text-slate-500 dark:text-on-surface-variant uppercase tracking-wider block mb-xs px-sm select-none font-bold text-left">Collaborations</div>
+                  <div className="space-y-xs max-h-[22vh] overflow-y-auto pr-xs">
+                    {collaboratedProjects.length === 0 ? (
+                      <div className="text-slate-400 dark:text-on-surface-variant text-[10px] italic px-sm text-left">No shared projects</div>
+                    ) : (
+                      collaboratedProjects.map(proj => (
+                        <a key={proj.id} onClick={() => loadProjectDetails(proj.id)} className={`flex items-center gap-xs px-sm py-xs rounded-DEFAULT transition-all cursor-pointer text-xs truncate max-w-xs font-code-sm ${activeProject?.id === proj.id ? "text-slate-900 dark:text-white bg-slate-100 dark:bg-white/10 border-l-2 border-secondary-container font-bold" : "text-slate-500 dark:text-on-surface-variant hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-white/5"}`}>
+                          <span className="material-symbols-outlined text-xs select-none">groups</span>
+                          {proj.name}
+                        </a>
+                      ))
+                    )}
+                  </div>
                 </div>
 
                 <div className="glow-divider my-xs select-none"></div>
@@ -726,17 +947,51 @@ export default function App() {
                 <div className="glow-divider my-xs select-none"></div>
 
                 {isBrainstormTab && (
-                  <>
-                    <div className="font-code-sm text-[10px] text-slate-500 dark:text-on-surface-variant uppercase tracking-wider block mb-xs px-sm select-none font-bold">Saved Projects</div>
-                    <div className="space-y-xs max-h-[25vh] overflow-y-auto">
-                      {projects.map(proj => (
-                        <a key={proj.id} onClick={() => { loadProjectDetails(proj.id); setMobileMenuOpen(false); }} className={`flex items-center gap-xs px-sm py-xs rounded-DEFAULT transition-all cursor-pointer text-xs truncate max-w-xs font-code-sm ${activeProject?.id === proj.id ? "text-slate-900 dark:text-white bg-slate-100 dark:bg-white/10 font-bold" : "text-slate-500 dark:text-on-surface-variant hover:text-slate-900 dark:hover:text-white"}`}>
-                          <span className="material-symbols-outlined text-xs select-none">folder</span>
-                          {proj.name}
-                        </a>
-                      ))}
+                  <div className="space-y-sm">
+                    {/* Invites (Mobile) */}
+                    {invitations.length > 0 && (
+                      <div className="bg-primary/5 dark:bg-primary-container/10 border border-primary/20 dark:border-primary-container/30 rounded p-xs space-y-xs text-left">
+                        <div className="font-code-sm text-[9px] text-primary dark:text-primary-fixed-dim uppercase tracking-wider font-bold">Uplink Invites ({invitations.length})</div>
+                        <div className="space-y-xs max-h-[12vh] overflow-y-auto">
+                          {invitations.map(inv => (
+                            <div key={inv.id} className="text-[9px] bg-white dark:bg-black/40 p-xs rounded border border-slate-200 dark:border-white/5 space-y-xs">
+                              <div className="font-bold text-slate-800 dark:text-primary-fixed-dim truncate">{inv.project_name}</div>
+                              <div className="flex gap-xs">
+                                <button onClick={() => respondToInvitation(inv.id, "accept")} className="flex-1 bg-green-600 text-white font-bold py-[2px] rounded text-[8px] uppercase">Accept</button>
+                                <button onClick={() => respondToInvitation(inv.id, "decline")} className="flex-1 bg-slate-500 text-white font-bold py-[2px] rounded text-[8px] uppercase">Decline</button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* My Projects (Mobile) */}
+                    <div>
+                      <div className="font-code-sm text-[10px] text-slate-500 dark:text-on-surface-variant uppercase tracking-wider block mb-xs px-sm select-none font-bold text-left">My Projects</div>
+                      <div className="space-y-xs max-h-[15vh] overflow-y-auto">
+                        {projects.map(proj => (
+                          <a key={proj.id} onClick={() => { loadProjectDetails(proj.id); setMobileMenuOpen(false); }} className={`flex items-center gap-xs px-sm py-xs rounded text-xs font-code-sm ${activeProject?.id === proj.id ? "text-slate-900 dark:text-white bg-slate-100 dark:bg-white/10 font-bold" : "text-slate-500 dark:text-on-surface-variant"}`}>
+                            <span className="material-symbols-outlined text-xs select-none">folder</span>
+                            {proj.name}
+                          </a>
+                        ))}
+                      </div>
                     </div>
-                  </>
+
+                    {/* Collaborations (Mobile) */}
+                    <div>
+                      <div className="font-code-sm text-[10px] text-slate-500 dark:text-on-surface-variant uppercase tracking-wider block mb-xs px-sm select-none font-bold text-left">Collaborations</div>
+                      <div className="space-y-xs max-h-[15vh] overflow-y-auto">
+                        {collaboratedProjects.map(proj => (
+                          <a key={proj.id} onClick={() => { loadProjectDetails(proj.id); setMobileMenuOpen(false); }} className={`flex items-center gap-xs px-sm py-xs rounded text-xs font-code-sm ${activeProject?.id === proj.id ? "text-slate-900 dark:text-white bg-slate-100 dark:bg-white/10 font-bold" : "text-slate-500 dark:text-on-surface-variant"}`}>
+                            <span className="material-symbols-outlined text-xs select-none">groups</span>
+                            {proj.name}
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
                 )}
               </div>
             </div>
@@ -958,7 +1213,47 @@ export default function App() {
                 )}
 
                 {/* VIEW 5: DEBATE DASHBOARD */}
-                {activeTab === "dashboard" && innerResult && (
+                {activeTab === "dashboard" && loadedResult?.status === "pending_selection" && (
+                  <div className="space-y-lg flex-1 text-left">
+                    <header className="border-b border-slate-200 dark:border-white/10 pb-sm">
+                      <div className="inline-flex items-center gap-xs px-xs py-base bg-primary/10 border border-primary/20 rounded-sm mb-xs select-none">
+                        <span className="font-code-sm text-label-xs text-primary dark:text-primary-fixed uppercase tracking-wider font-bold">Candidates Generated</span>
+                      </div>
+                      <h2 className="font-headline-lg md:text-[34px] font-[800] text-slate-800 dark:text-on-surface mb-xs">Select Candidate Topic of Interest</h2>
+                      <p className="font-body-md text-slate-600 dark:text-on-surface-variant max-w-2xl text-sm">
+                        Select which candidate proposal to initialize the multi-agent debate refinement pipeline on. You can visit the other generated concepts later in the "Alternative Proposals" tab.
+                      </p>
+                    </header>
+
+                    {candidateSelectionLoading ? (
+                      <div className="flex flex-col items-center justify-center py-2xl space-y-md">
+                        <div className="w-12 h-12 border-4 border-primary-container border-t-transparent rounded-full animate-spin"></div>
+                        <p className="font-code-sm text-sm text-primary animate-pulse">DEPLOYING EXPERT AGENT PANEL FOR REFINEMENT DEBATE...</p>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-md">
+                        {loadedResult.candidates?.map((cand, idx) => (
+                          <div key={idx} className="bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 rounded-xl p-md flex flex-col justify-between hover:border-primary-container transition-all hover:shadow-[0_0_15px_rgba(0,242,255,0.1)]">
+                            <div className="space-y-sm">
+                              <div className="flex items-center justify-between">
+                                <span className="font-code-sm text-[10px] text-slate-400 dark:text-on-surface-variant uppercase">Option #{idx + 1}</span>
+                                <span className="bg-primary/10 text-primary text-[9px] px-xs rounded font-bold uppercase">{cand.creator || "Innovation Agent"}</span>
+                              </div>
+                              <h3 className="font-headline-lg-mobile text-slate-900 dark:text-on-surface font-bold text-sm leading-tight">{cand.title}</h3>
+                              <p className="text-slate-600 dark:text-on-surface-variant text-xs leading-relaxed line-clamp-6">{cand.idea}</p>
+                            </div>
+                            
+                            <button onClick={() => selectCandidateIdea(cand)} className="mt-md w-full bg-primary-container hover:bg-primary-container/80 text-on-primary-container font-label-xs text-[10px] font-bold py-xs rounded uppercase tracking-widest transition-all">
+                              Initialize Refining Debate
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {activeTab === "dashboard" && innerResult && loadedResult?.status !== "pending_selection" && (
                   <div className="space-y-lg flex-1 text-left">
                     <header className="flex flex-col md:flex-row md:items-center justify-between gap-md border-b border-slate-200 dark:border-white/10 pb-sm">
                       <div>
@@ -967,272 +1262,363 @@ export default function App() {
                           {isGenerationKind ? "Generation & Refinement" : "Refinement Results"}
                         </div>
                         <h2 className="font-display-lg text-headline-lg font-bold text-slate-900 dark:text-primary">
-                          {isGenerationKind ? innerResult.conclusion?.selected_idea : activeProject?.name || "Refined Idea"}
+                          {isGenerationKind ? (loadedResult.selected_candidate?.title || innerResult.conclusion?.selected_idea || activeProject?.name) : activeProject?.name || "Refined Idea"}
                         </h2>
                         <p className="font-code-sm text-xs text-slate-500 dark:text-on-surface-variant mt-1">PROJECT_ID: {activeProject?.id}</p>
                       </div>
                       <div className="flex items-center gap-sm">
-                        <button onClick={() => { setActiveTab("pathway"); setActiveProject(null); setLoadedResult(null); }} className="bg-white hover:bg-slate-100 dark:bg-white/5 dark:hover:bg-white/10 text-slate-800 dark:text-on-surface font-label-xs text-label-xs py-sm px-md rounded-DEFAULT border border-slate-200 dark:border-white/10 transition-all uppercase tracking-widest font-bold shadow-xs">
+                        <button onClick={() => { setShowCollabModal(true); loadCollaborators(activeProject.id); }} className="bg-white hover:bg-slate-100 dark:bg-white/5 dark:hover:bg-white/10 text-slate-800 dark:text-on-surface font-label-xs text-label-xs py-sm px-md rounded-DEFAULT border border-slate-200 dark:border-white/10 transition-all uppercase tracking-widest font-bold shadow-xs flex items-center gap-xs">
+                          <span className="material-symbols-outlined text-xs">groups</span> Share Team
+                        </button>
+                        <button onClick={() => { setActiveTab("pathway"); setActiveProject(null); setLoadedResult(null); }} className="bg-slate-900 hover:bg-slate-850 dark:bg-primary-container dark:hover:bg-primary-container/80 text-white dark:text-on-primary-container font-label-xs text-label-xs py-sm px-md rounded-DEFAULT transition-all uppercase tracking-widest font-bold shadow-xs">
                           New Session
                         </button>
                       </div>
                     </header>
 
-                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-lg">
-                      
-                      {/* Left Panel */}
-                      <div className="lg:col-span-8 space-y-lg">
+                    {/* SubView Tabs Selector */}
+                    <div className="flex border-b border-slate-200 dark:border-white/10 mb-md gap-sm overflow-x-auto pr-base">
+                      <button onClick={() => setActiveTabSubView("overview")} className={`pb-xs font-label-xs text-xs uppercase tracking-widest font-bold border-b-2 transition-all ${activeTabSubView === "overview" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-white"}`}>Consensus / Roadmap</button>
+                      <button onClick={() => setActiveTabSubView("reviews")} className={`pb-xs font-label-xs text-xs uppercase tracking-widest font-bold border-b-2 transition-all ${activeTabSubView === "reviews" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-white"}`}>Specialist Reviews</button>
+                      <button onClick={() => setActiveTabSubView("debates")} className={`pb-xs font-label-xs text-xs uppercase tracking-widest font-bold border-b-2 transition-all ${activeTabSubView === "debates" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-white"}`}>Debate Rounds</button>
+                      <button onClick={() => setActiveTabSubView("chat")} className={`pb-xs font-label-xs text-xs uppercase tracking-widest font-bold border-b-2 transition-all ${activeTabSubView === "chat" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-white"}`}>Agent Chat Room</button>
+                      {loadedResult.candidates && loadedResult.candidates.length > 0 && (
+                        <button onClick={() => setActiveTabSubView("candidates")} className={`pb-xs font-label-xs text-xs uppercase tracking-widest font-bold border-b-2 transition-all ${activeTabSubView === "candidates" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-white"}`}>Alternative Ideas</button>
+                      )}
+                    </div>
+
+                    {/* SUBVIEW 1: OVERVIEW / CONSENSUS */}
+                    {activeTabSubView === "overview" && (
+                      <div className="grid grid-cols-1 lg:grid-cols-12 gap-lg">
                         
-                        {/* Factual Research */}
-                        {innerResult.research && Object.keys(innerResult.research).length > 0 && (
-                          <div className="bg-white dark:bg-[#0A0A0A]/80 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-xs">
-                            <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
-                              <span className="material-symbols-outlined text-sm">fact_check</span> Factual Research Brief
-                            </h3>
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-sm text-sm">
+                        {/* Left Panel */}
+                        <div className="lg:col-span-8 space-y-lg">
+                          {/* Factual Research */}
+                          {innerResult.research && Object.keys(innerResult.research).length > 0 && (
+                            <div className="bg-white dark:bg-[#0A0A0A]/80 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-xs">
+                              <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
+                                <span className="material-symbols-outlined text-sm">fact_check</span> Factual Research Brief
+                              </h3>
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-sm text-sm">
+                                <div className="space-y-xs">
+                                  <h4 className="font-code-sm text-xs font-bold text-slate-800 dark:text-secondary-fixed uppercase">Verified Claims / Facts</h4>
+                                  <ul className="space-y-xs max-h-48 overflow-y-auto pr-xs">
+                                    {(() => {
+                                      let facts = [];
+                                      if (Array.isArray(innerResult.research.facts)) {
+                                        facts = innerResult.research.facts;
+                                      } else {
+                                        Object.values(innerResult.research).forEach(b => {
+                                          if (b.facts) facts.push(...b.facts);
+                                        });
+                                      }
+                                      return facts.map((fact, idx) => (
+                                        <li key={idx} className="border-b border-slate-100 dark:border-white/5 pb-xs mb-xs">
+                                          <span className="text-[10px] px-xs bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded uppercase font-bold text-slate-500 dark:text-on-surface-variant mr-1">{fact.strength || "med"}</span>
+                                          <span className="text-xs text-slate-800 dark:text-white">{fact.claim}</span>
+                                          <span className="text-[10px] text-slate-500 dark:text-on-surface-variant block mt-xs">Source: {fact.source}</span>
+                                        </li>
+                                      ));
+                                    })()}
+                                  </ul>
+                                </div>
+                                <div className="space-y-sm">
+                                  <div className="space-y-xs">
+                                    <h4 className="font-code-sm text-xs font-bold text-red-500 dark:text-error uppercase">Problem Signals</h4>
+                                    <ul className="list-disc list-inside text-slate-500 dark:text-on-surface-variant space-y-xs pl-xs max-h-24 overflow-y-auto text-xs">
+                                      {(() => {
+                                        let probs = [];
+                                        if (Array.isArray(innerResult.research.problem_signals)) {
+                                          probs = innerResult.research.problem_signals;
+                                        } else {
+                                          Object.values(innerResult.research).forEach(b => {
+                                            if (b.problem_signals) probs.push(...b.problem_signals);
+                                          });
+                                        }
+                                        return probs.map((p, idx) => <li key={idx}>{p}</li>);
+                                      })()}
+                                    </ul>
+                                  </div>
+                                  <div className="space-y-xs">
+                                    <h4 className="font-code-sm text-xs font-bold text-slate-800 dark:text-primary-fixed uppercase">Unverified / Data Gaps</h4>
+                                    <ul className="list-disc list-inside text-slate-500 dark:text-on-surface-variant space-y-xs pl-xs max-h-24 overflow-y-auto text-xs">
+                                      {(() => {
+                                        let gaps = [];
+                                        if (Array.isArray(innerResult.research.gap_notes)) {
+                                          gaps = innerResult.research.gap_notes;
+                                        } else {
+                                          Object.values(innerResult.research).forEach(b => {
+                                            if (b.gap_notes) gaps.push(...b.gap_notes);
+                                          });
+                                        }
+                                        return gaps.map((g, idx) => <li key={idx}>{g}</li>);
+                                      })()}
+                                    </ul>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Operator Feedback Iteration */}
+                          {innerResult.moderator && (
+                            <div className="bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-xs">
+                              <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
+                                <span className="material-symbols-outlined text-sm">settings_backup_restore</span> Operator Decision Loop
+                              </h3>
+                              <p className="text-xs text-slate-500 dark:text-on-surface-variant leading-relaxed">Select improvements to adopt and rerun the debates with the updated baseline concept.</p>
+                              
+                              <div className="space-y-sm pt-xs text-slate-700 dark:text-on-surface-variant" id="decision-checklist">
+                                {(innerResult.moderator.high_priority_improvements || []).map((imp, idx) => (
+                                  <div key={idx} className="flex items-start gap-xs text-xs">
+                                    <input type="checkbox" id={`improve-${idx}`} defaultChecked value={imp} className="rounded border-slate-300 dark:border-white/10 bg-slate-50 dark:bg-[#131313] text-secondary-container focus:ring-secondary-container mt-base" />
+                                    <label htmlFor={`improve-${idx}`} className="select-none leading-relaxed">{imp}</label>
+                                  </div>
+                                ))}
+                              </div>
+
+                              <div className="space-y-xs pt-xs">
+                                <label className="font-code-sm text-[10px] text-slate-500 dark:text-on-surface-variant uppercase block font-bold">Operator Guidance Notes</label>
+                                <textarea value={operatorNotes} onChange={e => setOperatorNotes(e.target.value)} placeholder="e.g. Keep sensor checks, but simplify battery settings..." rows="3" className="w-full bg-slate-50 dark:bg-[#131313] border border-slate-200 dark:border-white/10 text-slate-900 dark:text-on-surface p-xs font-code-sm text-xs rounded-DEFAULT focus:outline-none focus:border-slate-400 dark:focus:border-secondary-container transition-all"></textarea>
+                              </div>
+
+                              <button onClick={triggerIteration} className="w-full bg-slate-900 dark:bg-secondary-container text-white dark:text-on-secondary-container font-label-xs text-label-xs py-sm rounded-DEFAULT hover:shadow-md transition-all uppercase tracking-widest font-bold flex items-center justify-center gap-xs">
+                                Iterate Concept
+                                <span className="material-symbols-outlined text-sm">sync</span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Right Panel */}
+                        <div className="lg:col-span-4 space-y-lg text-left">
+                          {/* Moderator Synthesis */}
+                          {innerResult.moderator && (
+                            <div className="bg-white dark:bg-[#0A0A0A]/90 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-md shadow-sm relative overflow-hidden">
+                              <div className="absolute top-0 right-0 py-base px-sm bg-slate-100 dark:bg-primary-container/20 border-b border-l border-slate-200 dark:border-white/10 rounded-bl font-label-xs text-[9px] text-slate-700 dark:text-primary uppercase font-bold tracking-widest select-none">
+                                Moderator Synthesis
+                              </div>
+                              <div className="space-y-sm mt-xs">
+                                <h3 className="font-headline-lg-mobile font-bold text-slate-900 dark:text-white tracking-tight leading-snug">Refined Hackathon Concept</h3>
+                                <p className="text-sm text-slate-900 dark:text-on-surface bg-slate-50 dark:bg-[#131313] p-sm border border-slate-200 dark:border-white/5 rounded font-medium leading-relaxed">{innerResult.moderator.refined_idea}</p>
+                              </div>
+                              <div className="glow-divider my-sm"></div>
+                              <div className="space-y-sm text-xs font-code-sm">
+                                <div className="space-y-xs">
+                                  <span className="text-slate-500 dark:text-on-surface-variant uppercase text-[10px] block tracking-wide font-bold">Consensus Agreements</span>
+                                  <ul className="list-disc list-inside text-slate-700 dark:text-tertiary space-y-xs pl-xs">
+                                    {(innerResult.moderator.consensus || []).map((c, idx) => <li key={idx}>{c}</li>)}
+                                  </ul>
+                                </div>
+                                <div className="space-y-xs">
+                                  <span className="text-slate-500 dark:text-on-surface-variant uppercase text-[10px] block tracking-wide font-bold">Specialist Trade-offs</span>
+                                  <ul className="list-disc list-inside text-slate-700 dark:text-secondary space-y-xs pl-xs">
+                                    {(innerResult.moderator.tradeoffs || []).map((t, idx) => <li key={idx}>{t}</li>)}
+                                  </ul>
+                                </div>
+                              </div>
+                              <div className="glow-divider my-sm"></div>
                               <div className="space-y-xs">
-                                <h4 className="font-code-sm text-xs font-bold text-slate-800 dark:text-secondary-fixed uppercase">Verified Claims / Facts</h4>
-                                <ul className="space-y-xs max-h-48 overflow-y-auto pr-xs">
-                                  {(() => {
-                                    let facts = [];
-                                    if (Array.isArray(innerResult.research.facts)) {
-                                      facts = innerResult.research.facts;
-                                    } else {
-                                      Object.values(innerResult.research).forEach(b => {
-                                        if (b.facts) facts.push(...b.facts);
-                                      });
-                                    }
-                                    return facts.map((fact, idx) => (
-                                      <li key={idx} className="border-b border-slate-100 dark:border-white/5 pb-xs mb-xs">
-                                        <span className="text-[10px] px-xs bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded uppercase font-bold text-slate-500 dark:text-on-surface-variant mr-1">{fact.strength || "med"}</span>
-                                        <span className="text-xs text-slate-800 dark:text-white">{fact.claim}</span>
-                                        <span className="text-[10px] text-slate-500 dark:text-on-surface-variant block mt-xs">Source: {fact.source}</span>
-                                      </li>
-                                    ));
-                                  })()}
-                                </ul>
-                              </div>
-                              <div className="space-y-sm">
-                                <div className="space-y-xs">
-                                  <h4 className="font-code-sm text-xs font-bold text-red-500 dark:text-error uppercase">Problem Signals</h4>
-                                  <ul className="list-disc list-inside text-slate-500 dark:text-on-surface-variant space-y-xs pl-xs max-h-24 overflow-y-auto text-xs">
-                                    {(() => {
-                                      let probs = [];
-                                      if (Array.isArray(innerResult.research.problem_signals)) {
-                                        probs = innerResult.research.problem_signals;
-                                      } else {
-                                        Object.values(innerResult.research).forEach(b => {
-                                          if (b.problem_signals) probs.push(...b.problem_signals);
-                                        });
-                                      }
-                                      return probs.map((p, idx) => <li key={idx}>{p}</li>);
-                                    })()}
-                                  </ul>
-                                </div>
-                                <div className="space-y-xs">
-                                  <h4 className="font-code-sm text-xs font-bold text-slate-800 dark:text-primary-fixed uppercase">Unverified / Data Gaps</h4>
-                                  <ul className="list-disc list-inside text-slate-500 dark:text-on-surface-variant space-y-xs pl-xs max-h-24 overflow-y-auto text-xs">
-                                    {(() => {
-                                      let gaps = [];
-                                      if (Array.isArray(innerResult.research.gap_notes)) {
-                                        gaps = innerResult.research.gap_notes;
-                                      } else {
-                                        Object.values(innerResult.research).forEach(b => {
-                                          if (b.gap_notes) gaps.push(...b.gap_notes);
-                                        });
-                                      }
-                                      return gaps.map((g, idx) => <li key={idx}>{g}</li>);
-                                    })()}
-                                  </ul>
-                                </div>
+                                <h4 className="font-display-lg text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider">Implementation Roadmap</h4>
+                                <ol className="space-y-sm pl-xs pt-xs">
+                                  {(innerResult.moderator.implementation_roadmap || []).map((step, idx) => (
+                                    <li key={idx} className="flex gap-xs items-start">
+                                      <span className="w-5 h-5 bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-800 dark:text-primary-fixed-dim rounded-full flex items-center justify-center flex-shrink-0 text-[10px] font-bold mt-base">{idx+1}</span>
+                                      <p className="text-xs text-slate-600 dark:text-on-surface-variant leading-normal pt-base">{step}</p>
+                                    </li>
+                                  ))}
+                                </ol>
                               </div>
                             </div>
-                          </div>
-                        )}
+                          )}
+                        </div>
+                      </div>
+                    )}
 
-                        {/* Candidate Proposals */}
-                        {isGenerationKind && innerResult.candidates && (
-                          <div className="bg-white dark:bg-[#0A0A0A]/80 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-xs">
-                            <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
-                              <span className="material-symbols-outlined text-sm">lightbulb</span> Pooled Candidate Proposals
-                            </h3>
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-sm">
-                              {innerResult.candidates.map((cand, idx) => (
-                                <div key={idx} onClick={() => openCandidateModal(cand)} className="bg-slate-50 dark:bg-[#131313] border border-slate-200 dark:border-white/10 p-sm rounded hover:border-slate-400 dark:hover:border-primary-container transition-all cursor-pointer text-left">
-                                  <div className="flex justify-between items-center mb-xs">
-                                    <h4 className="font-bold text-slate-800 dark:text-white text-xs">{cand.title}</h4>
-                                    <span className="text-[10px] px-xs bg-slate-100 dark:bg-primary/10 border border-slate-200 dark:border-primary/30 rounded text-slate-600 dark:text-primary">Score: {cand.hackathon_fit}/10</span>
+                    {/* SUBVIEW 2: SPECIALIST REVIEWS */}
+                    {activeTabSubView === "reviews" && (
+                      <div className="space-y-md">
+                        <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
+                          <span className="material-symbols-outlined text-sm">groups</span> Independent Agent Feedback
+                        </h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-md">
+                          {["Innovation", "Feasibility", "Impact", "Technical", "Skeptic"].map(name => {
+                            const key = name.toLowerCase();
+                            const reviews = innerResult.refined_reviews || innerResult.reviews || {};
+                            const reflections = innerResult.refined_reflections || innerResult.reflections || {};
+                            const rev = reviews[key] || reviews[name];
+                            const refl = reflections[key] || reflections[name];
+
+                            if (!rev) return null;
+
+                            return (
+                              <div key={name} className="bg-white dark:bg-[#131313] border border-slate-200 dark:border-white/10 p-md rounded-xl hover:border-slate-400 dark:hover:border-secondary transition-all flex flex-col justify-between shadow-xs">
+                                <div>
+                                  <div className="flex justify-between items-center border-b border-slate-100 dark:border-white/5 pb-xs mb-sm">
+                                    <h4 className="font-bold text-slate-800 dark:text-white text-xs uppercase tracking-wide font-display-lg">{name}</h4>
+                                    {refl && refl.new_score !== undefined && refl.new_score !== rev.score ? (
+                                      <div className="flex items-center gap-xs">
+                                        <span className="text-xs line-through text-slate-400 dark:text-on-surface-variant">{rev.score}</span>
+                                        <span className="text-sm font-bold text-slate-900 dark:text-tertiary font-display-lg">{refl.new_score}/10</span>
+                                      </div>
+                                    ) : (
+                                      <span className="text-sm font-bold text-slate-900 dark:text-secondary font-display-lg">{rev.score}/10</span>
+                                    )}
                                   </div>
-                                  <p className="text-xs text-slate-500 dark:text-on-surface-variant line-clamp-2">{cand.idea}</p>
+                                  <div className="space-y-sm text-xs text-left">
+                                    <div>
+                                      <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold">Strengths</span>
+                                      <p className="text-slate-800 dark:text-on-surface leading-normal">{rev.strengths ? rev.strengths.join(", ") : "None specified"}</p>
+                                    </div>
+                                    <div>
+                                      <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold">Suggestions Adopted</span>
+                                      <p className="text-slate-800 dark:text-on-surface leading-normal">{rev.suggestions ? rev.suggestions.join(", ") : "None specified"}</p>
+                                    </div>
+                                  </div>
                                 </div>
-                              ))}
-                            </div>
-                          </div>
-                        )}
+                                <button onClick={() => openAgentModal(name)} className="mt-sm w-full bg-slate-50 hover:bg-slate-100 dark:bg-white/5 dark:hover:bg-white/10 text-slate-800 dark:text-on-surface font-code-sm text-[10px] py-xs rounded uppercase tracking-wider transition-all border border-slate-200 dark:border-white/5">
+                                  Read Debate Log
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
 
-                        {/* Agent Panels */}
-                        <div className="space-y-md">
+                    {/* SUBVIEW 3: STRUCTURED DEBATES */}
+                    {activeTabSubView === "debates" && (
+                      <div className="bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-xs">
+                        <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
+                          <span className="material-symbols-outlined text-sm">chat_bubble</span> Structured Debate Cross-Examination
+                        </h3>
+                        <div className="space-y-sm max-h-[500px] overflow-y-auto pr-xs border border-slate-200 dark:border-white/5 bg-slate-50 dark:bg-[#131313]/60 p-sm rounded font-code-sm text-xs text-left">
+                          {chats && chats.length > 0 ? (
+                            chats.map((chat, idx) => (
+                              <div key={idx} className="border-b border-slate-100 dark:border-white/5 pb-xs mb-xs">
+                                <div className="flex items-center gap-xs mb-xs">
+                                  <span className="font-bold uppercase text-slate-800 dark:text-white">{chat.sender}</span>
+                                  <span className="text-[9px] text-slate-500 dark:text-on-surface-variant">{new Date(chat.created_at).toLocaleTimeString()}</span>
+                                </div>
+                                <p className="text-slate-600 dark:text-on-surface-variant leading-relaxed">{chat.message}</p>
+                              </div>
+                            ))
+                          ) : (
+                            <div className="text-slate-500 dark:text-on-surface-variant text-center py-sm">No structured debates recorded for this session.</div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* SUBVIEW 4: INTERACTIVE AGENT CHAT ROOM */}
+                    {activeTabSubView === "chat" && (
+                      <div className="grid grid-cols-1 lg:grid-cols-12 gap-lg bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 p-md rounded-xl shadow-xs min-h-[500px]">
+                        
+                        {/* Left pane: Agent selector */}
+                        <div className="lg:col-span-4 lg:border-r lg:border-slate-200 lg:dark:border-white/10 lg:pr-md space-y-md">
                           <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
-                            <span className="material-symbols-outlined text-sm">groups</span> Specialist Agent Panel (Debate & Reflections)
+                            <span className="material-symbols-outlined text-sm">support_agent</span> Select Agent Target
                           </h3>
-                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-sm">
-                            {["Innovation", "Feasibility", "Impact", "Technical", "Skeptic"].map(name => {
-                              const key = name.toLowerCase();
-                              const reviews = innerResult.refined_reviews || innerResult.reviews || {};
-                              const reflections = innerResult.refined_reflections || innerResult.reflections || {};
-                              const rev = reviews[key] || reviews[name];
-                              const refl = reflections[key] || reflections[name];
-
-                              if (!rev) return null;
-
-                              return (
-                                <div key={name} className="bg-white dark:bg-[#131313] border border-slate-200 dark:border-white/10 p-sm rounded-lg hover:border-slate-400 dark:hover:border-secondary transition-all flex flex-col justify-between shadow-xs">
-                                  <div>
-                                    <div className="flex justify-between items-center border-b border-slate-100 dark:border-white/5 pb-xs mb-sm">
-                                      <h4 className="font-bold text-slate-800 dark:text-white text-xs uppercase tracking-wide font-display-lg">{name}</h4>
-                                      {refl && refl.new_score !== undefined && refl.new_score !== rev.score ? (
-                                        <div className="flex items-center gap-xs">
-                                          <span className="text-xs line-through text-slate-400 dark:text-on-surface-variant">{rev.score}</span>
-                                          <span className="text-sm font-bold text-slate-900 dark:text-tertiary font-display-lg">{refl.new_score}/10</span>
-                                        </div>
-                                      ) : (
-                                        <span className="text-sm font-bold text-slate-900 dark:text-secondary font-display-lg">{rev.score}/10</span>
-                                      )}
-                                    </div>
-                                    <div className="space-y-sm text-xs text-left">
-                                      <div>
-                                        <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold">Strengths</span>
-                                        <p className="text-slate-800 dark:text-on-surface line-clamp-2">{rev.strengths ? rev.strengths.join(", ") : "None specified"}</p>
-                                      </div>
-                                      <div>
-                                        <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold">Suggestions Adopted</span>
-                                        <p className="text-slate-800 dark:text-on-surface line-clamp-2">{rev.suggestions ? rev.suggestions.join(", ") : "None specified"}</p>
-                                      </div>
-                                    </div>
-                                  </div>
-                                  <button onClick={() => openAgentModal(name)} className="mt-sm w-full bg-slate-50 hover:bg-slate-100 dark:bg-white/5 dark:hover:bg-white/10 text-slate-800 dark:text-on-surface font-code-sm text-[10px] py-xs rounded uppercase tracking-wider transition-all border border-slate-200 dark:border-white/5">
-                                    Read Debate Log
-                                  </button>
+                          <p className="text-xs text-slate-500 dark:text-on-surface-variant leading-relaxed">
+                            Select one of the debate panel agents below to ask questions, challenge their feedback, or brainstorm updates in character.
+                          </p>
+                          
+                          <div className="flex flex-col gap-xs">
+                            {[
+                              { id: "skeptic", label: "Skeptic Agent", desc: "Devil's advocate & failure modes detector", icon: "security_update_warning", color: "text-red-500" },
+                              { id: "innovation", label: "Innovation Agent", desc: "Novelty & creative edge specialist", icon: "tips_and_updates", color: "text-yellow-500" },
+                              { id: "feasibility", label: "Feasibility Agent", desc: "Engineering reality & constraint checker", icon: "construction", color: "text-purple-500" },
+                              { id: "impact", label: "Impact Agent", desc: "Utility, WOW factor & value advisor", icon: "stars", color: "text-blue-500" },
+                              { id: "technical", label: "Technical Agent", desc: "Software & system architecture expert", icon: "developer_board", color: "text-green-500" },
+                              { id: "moderator", label: "Moderator Consensus", desc: "Synthesis & summary builder", icon: "gavel", color: "text-slate-400" }
+                            ].map(agent => (
+                              <button key={agent.id} onClick={() => setSelectedAgentForChat(agent.id)} className={`flex items-start gap-sm p-sm rounded-DEFAULT border text-left transition-all ${selectedAgentForChat === agent.id ? "bg-primary/5 border-primary/45 shadow-xs" : "border-transparent hover:bg-slate-50 dark:hover:bg-white/5"}`}>
+                                <span className={`material-symbols-outlined text-lg ${agent.color}`}>{agent.icon}</span>
+                                <div className="space-y-base">
+                                  <div className="font-bold text-xs text-slate-900 dark:text-white leading-none">{agent.label}</div>
+                                  <div className="text-[10px] text-slate-500 dark:text-on-surface-variant leading-tight">{agent.desc}</div>
                                 </div>
-                              );
-                            })}
+                              </button>
+                            ))}
                           </div>
                         </div>
 
-                        {/* Debate Chats */}
-                        <div className="bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-xs">
-                          <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
-                            <span className="material-symbols-outlined text-sm">chat_bubble</span> Structured Debate Cross-Examination
-                          </h3>
-                          <div className="space-y-sm max-h-96 overflow-y-auto pr-xs border border-slate-200 dark:border-white/5 bg-slate-50 dark:bg-[#131313]/60 p-sm rounded font-code-sm text-xs text-left">
+                        {/* Right pane: Chat messages board */}
+                        <div className="lg:col-span-8 flex flex-col justify-between h-[500px] mt-md lg:mt-0">
+                          
+                          {/* Target Agent Info Header */}
+                          <div className="border-b border-slate-200 dark:border-white/10 pb-xs mb-sm flex justify-between items-center">
+                            <div>
+                              <span className="font-code-sm text-[10px] text-slate-400 dark:text-on-surface-variant uppercase">Uplink Target</span>
+                              <h4 className="font-bold text-slate-900 dark:text-white text-sm capitalize">{selectedAgentForChat} Agent</h4>
+                            </div>
+                            <span className="material-symbols-outlined text-slate-400 text-sm animate-pulse">online_prediction</span>
+                          </div>
+
+                          {/* Messages list */}
+                          <div className="flex-1 overflow-y-auto space-y-sm pr-xs mb-md border border-slate-200 dark:border-white/5 bg-slate-50 dark:bg-black/20 p-sm rounded font-code-sm text-xs">
                             {chats && chats.length > 0 ? (
-                              chats.map((chat, idx) => (
-                                <div key={idx} className="border-b border-slate-100 dark:border-white/5 pb-xs mb-xs">
-                                  <div className="flex items-center gap-xs mb-xs">
-                                    <span className="font-bold uppercase text-slate-800 dark:text-white">{chat.sender}</span>
-                                    <span className="text-[9px] text-slate-500 dark:text-on-surface-variant">{new Date(chat.created_at).toLocaleTimeString()}</span>
+                              chats.map((chat, idx) => {
+                                const isUser = chat.sender.toLowerCase() === username.toLowerCase();
+                                return (
+                                  <div key={idx} className={`flex flex-col ${isUser ? "items-end" : "items-start"}`}>
+                                    <div className={`max-w-[80%] rounded-lg p-sm border ${isUser ? "bg-slate-200 dark:bg-[#1f2022] text-slate-900 dark:text-white border-slate-300 dark:border-white/10" : "bg-white dark:bg-[#131313] text-slate-800 dark:text-on-surface border-slate-200 dark:border-white/5"}`}>
+                                      <div className="font-bold text-[9px] text-slate-500 dark:text-on-surface-variant uppercase mb-xs flex justify-between gap-md border-b border-slate-100 dark:border-white/5 pb-[2px]">
+                                        <span>{chat.sender}</span>
+                                        <span>{new Date(chat.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                                      </div>
+                                      <p className="leading-relaxed break-words">{chat.message}</p>
+                                    </div>
                                   </div>
-                                  <p className="text-slate-600 dark:text-on-surface-variant leading-relaxed">{chat.message}</p>
-                                </div>
-                              ))
+                                );
+                              })
                             ) : (
-                              <div className="text-slate-500 dark:text-on-surface-variant text-center py-sm">No structured debates recorded for this session.</div>
+                              <div className="text-slate-500 dark:text-on-surface-variant text-center py-xl">No operator follow-up logs recorded. Send a message to initiate debate.</div>
+                            )}
+                            
+                            {chatLoading && (
+                              <div className="flex flex-col items-start">
+                                <div className="bg-white dark:bg-[#131313] text-slate-500 rounded-lg p-sm border border-slate-200 dark:border-white/5 animate-pulse font-code-sm">
+                                  {selectedAgentForChat.toUpperCase()} Agent is running inference response...
+                                </div>
+                              </div>
                             )}
                           </div>
+
+                          {/* Message input form */}
+                          <form onSubmit={sendAgentMessage} className="flex gap-sm">
+                            <input type="text" value={chatInput} onChange={e => setChatInput(e.target.value)} placeholder={`Type follow-up query for the ${selectedAgentForChat} agent...`} className="flex-1 bg-slate-50 dark:bg-[#131313] border border-slate-200 dark:border-white/10 text-slate-900 dark:text-on-surface p-sm font-code-sm text-xs rounded-DEFAULT focus:outline-none focus:border-primary-container focus:ring-1 focus:ring-primary-container transition-all" />
+                            <button type="submit" disabled={chatLoading} className="bg-primary-container hover:bg-primary-container/80 text-on-primary-container font-label-xs text-xs font-bold py-xs px-md rounded uppercase tracking-widest transition-all flex items-center gap-xs">
+                              <span className="material-symbols-outlined text-sm">send</span> Transmit
+                            </button>
+                          </form>
                         </div>
                       </div>
+                    )}
 
-                      {/* Right Panel */}
-                      <div className="lg:col-span-4 space-y-lg text-left">
-                        
-                        {/* Selected Idea (Generate Only) */}
-                        {isGenerationKind && innerResult.conclusion && (
-                          <div className="bg-white dark:bg-[#0A0A0A]/80 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-xs">
-                            <div className="inline-flex items-center gap-xs px-xs py-base bg-slate-100 dark:bg-primary/10 border border-slate-200 dark:border-primary/20 rounded-sm">
-                              <span className="font-label-xs text-[10px] text-slate-700 dark:text-primary uppercase font-bold tracking-widest">Selected Concept</span>
-                            </div>
-                            <h4 className="font-headline-lg-mobile font-bold text-slate-900 dark:text-white text-sm">{innerResult.conclusion.selected_idea}</h4>
-                            <p className="text-sm text-slate-600 dark:text-on-surface-variant">{innerResult.conclusion.rationale}</p>
-                            <div className="pt-xs border-t border-slate-200 dark:border-white/10 space-y-xs">
-                              <span className="font-code-sm text-[10px] text-slate-500 dark:text-on-surface-variant uppercase block">Ranked Ideas</span>
-                              <ol className="list-decimal list-inside text-xs text-slate-700 dark:text-primary-fixed-dim space-y-xs">
-                                {(innerResult.conclusion.ranked_ideas || []).map((r, idx) => <li key={idx}>{r}</li>)}
-                              </ol>
-                            </div>
-                          </div>
-                        )}
-
-                        {/* Moderator Synthesis */}
-                        {innerResult.moderator && (
-                          <div className="bg-white dark:bg-[#0A0A0A]/90 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-md shadow-sm relative overflow-hidden">
-                            <div className="absolute top-0 right-0 py-base px-sm bg-slate-100 dark:bg-primary-container/20 border-b border-l border-slate-200 dark:border-white/10 rounded-bl font-label-xs text-[9px] text-slate-700 dark:text-primary uppercase font-bold tracking-widest select-none">
-                              Moderator Synthesis
-                            </div>
-                            <div className="space-y-sm mt-xs">
-                              <h3 className="font-headline-lg-mobile font-bold text-slate-900 dark:text-white tracking-tight leading-snug">Refined Hackathon Concept</h3>
-                              <p className="text-sm text-slate-900 dark:text-on-surface bg-slate-50 dark:bg-[#131313] p-sm border border-slate-200 dark:border-white/5 rounded font-medium leading-relaxed">{innerResult.moderator.refined_idea}</p>
-                            </div>
-                            <div className="glow-divider my-sm"></div>
-                            <div className="space-y-sm text-xs font-code-sm">
-                              <div className="space-y-xs">
-                                <span className="text-slate-500 dark:text-on-surface-variant uppercase text-[10px] block tracking-wide font-bold">Consensus Agreements</span>
-                                <ul className="list-disc list-inside text-slate-700 dark:text-tertiary space-y-xs pl-xs">
-                                  {(innerResult.moderator.consensus || []).map((c, idx) => <li key={idx}>{c}</li>)}
-                                </ul>
+                    {/* SUBVIEW 5: ALTERNATIVE IDEAS */}
+                    {activeTabSubView === "candidates" && loadedResult.candidates && (
+                      <div className="bg-white dark:bg-[#0A0A0A]/80 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-xs">
+                        <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
+                          <span className="material-symbols-outlined text-sm">lightbulb</span> Pooled Candidate Proposals
+                        </h3>
+                        <p className="text-xs text-slate-500 dark:text-on-surface-variant leading-relaxed">
+                          Below are all the alternative candidate topics generated by the brainstorm run. Feel free to review their hackathon fit scores.
+                        </p>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-sm pt-sm">
+                          {loadedResult.candidates.map((cand, idx) => (
+                            <div key={idx} onClick={() => openCandidateModal(cand)} className="bg-slate-50 dark:bg-[#131313] border border-slate-200 dark:border-white/10 p-sm rounded hover:border-slate-400 dark:hover:border-primary-container transition-all cursor-pointer text-left">
+                              <div className="flex justify-between items-center mb-xs">
+                                <h4 className="font-bold text-slate-800 dark:text-white text-xs">{cand.title}</h4>
+                                <span className="text-[10px] px-xs bg-slate-100 dark:bg-primary/10 border border-slate-200 dark:border-primary/30 rounded text-slate-600 dark:text-primary">Creator: {cand.creator || "AI Agent"}</span>
                               </div>
-                              <div className="space-y-xs">
-                                <span className="text-slate-500 dark:text-on-surface-variant uppercase text-[10px] block tracking-wide font-bold">Specialist Trade-offs</span>
-                                <ul className="list-disc list-inside text-slate-700 dark:text-secondary space-y-xs pl-xs">
-                                  {(innerResult.moderator.tradeoffs || []).map((t, idx) => <li key={idx}>{t}</li>)}
-                                </ul>
-                              </div>
+                              <p className="text-xs text-slate-500 dark:text-on-surface-variant line-clamp-3">{cand.idea}</p>
                             </div>
-                            <div className="glow-divider my-sm"></div>
-                            <div className="space-y-xs">
-                              <h4 className="font-display-lg text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider">Implementation Roadmap</h4>
-                              <ol className="space-y-sm pl-xs pt-xs">
-                                {(innerResult.moderator.implementation_roadmap || []).map((step, idx) => (
-                                  <li key={idx} className="flex gap-xs items-start">
-                                    <span className="w-5 h-5 bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-800 dark:text-primary-fixed-dim rounded-full flex items-center justify-center flex-shrink-0 text-[10px] font-bold mt-base">{idx+1}</span>
-                                    <p className="text-xs text-slate-600 dark:text-on-surface-variant leading-normal pt-base">{step}</p>
-                                  </li>
-                                ))}
-                              </ol>
-                            </div>
-                          </div>
-                        )}
-
-                        {/* Operator Feedback Iteration */}
-                        {innerResult.moderator && (
-                          <div className="bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-xs">
-                            <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
-                              <span className="material-symbols-outlined text-sm">settings_backup_restore</span> Operator Decision Loop
-                            </h3>
-                            <p className="text-xs text-slate-500 dark:text-on-surface-variant leading-relaxed">Select improvements to adopt and rerun the debates with the updated baseline concept.</p>
-                            
-                            <div className="space-y-sm pt-xs text-slate-700 dark:text-on-surface-variant" id="decision-checklist">
-                              {(innerResult.moderator.high_priority_improvements || []).map((imp, idx) => (
-                                <div key={idx} className="flex items-start gap-xs text-xs">
-                                  <input type="checkbox" id={`improve-${idx}`} defaultChecked value={imp} className="rounded border-slate-300 dark:border-white/10 bg-slate-50 dark:bg-[#131313] text-secondary-container focus:ring-secondary-container mt-base" />
-                                  <label htmlFor={`improve-${idx}`} className="select-none leading-relaxed">{imp}</label>
-                                </div>
-                              ))}
-                            </div>
-
-                            <div className="space-y-xs pt-xs">
-                              <label className="font-code-sm text-[10px] text-slate-500 dark:text-on-surface-variant uppercase block font-bold">Operator Guidance Notes</label>
-                              <textarea value={operatorNotes} onChange={e => setOperatorNotes(e.target.value)} placeholder="e.g. Keep sensor checks, but simplify battery settings..." rows="3" className="w-full bg-slate-50 dark:bg-[#131313] border border-slate-200 dark:border-white/10 text-slate-900 dark:text-on-surface p-xs font-code-sm text-xs rounded-DEFAULT focus:outline-none focus:border-slate-400 dark:focus:border-secondary-container transition-all"></textarea>
-                            </div>
-
-                            <button onClick={triggerIteration} className="w-full bg-slate-900 dark:bg-secondary-container text-white dark:text-on-secondary-container font-label-xs text-label-xs py-sm rounded-DEFAULT hover:shadow-md transition-all uppercase tracking-widest font-bold flex items-center justify-center gap-xs">
-                              Iterate Concept
-                              <span className="material-symbols-outlined text-sm">sync</span>
-                            </button>
-                          </div>
-                        )}
-
+                          ))}
+                        </div>
                       </div>
-                    </div>
+                    )}
+
                   </div>
                 )}
 
