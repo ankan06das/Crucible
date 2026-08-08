@@ -6,8 +6,7 @@ from pydantic_settings import BaseSettings
 load_dotenv()
 
 class LLMSettings(BaseSettings):
-    provider: str = "gemini"
-    model: str = "gemini/gemini-2.5-flash"
+    model: str = "meta/llama-3.1-8b-instruct"
     api_key: str = ""
 
     max_retries: int = 5
@@ -17,8 +16,14 @@ class LLMSettings(BaseSettings):
     @model_validator(mode="after")
     def _resolve_api_key(self):
         if not self.api_key:
-            env_name = f"{self.provider.replace('-', '_').upper()}_API_KEY"
-            self.api_key = os.getenv(env_name, "")
+            self.api_key = os.getenv("NVIDIA_API_KEY", "")
         return self
 
+class A2ASettings(BaseSettings):
+    base_url: str = "http://localhost:8000"
+    route_prefix: str = "/agents"
+
+    model_config = {"env_file": ".env", "extra": "ignore"}
+
 settings = LLMSettings()
+a2a_settings = A2ASettings()

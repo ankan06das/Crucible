@@ -5,3 +5,10 @@ __pycache__/
 *.db
 .DS_Store
 notes
+
+# graphify
+graphify-out/
+.graphify/
+
+#opencode
+.opencode

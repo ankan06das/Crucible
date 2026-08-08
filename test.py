@@ -1,17 +1,27 @@
-from llm import LLM
-from core.config import LLMSettings
 import asyncio
+from fastapi import FastAPI
 
-from schemas.idea import IdeaResponse
+from llm import LLM
+from orchestrator import run_pipeline
 
-async def main():
-    settings = LLMSettings(
-        provider="groq",
-        model="groq/llama-3.1-8b-instant"
-    )
-    llm = LLM(settings)
-    response = await llm.generate_json("We want to build an app for college students that turns their messy handwritten notes into digital flashcards for exam prep. We're a team of 3 and we have 24 hours. We want to win the Best AI Award and keep everything on free-tier tools since we have no budget.", response_format=IdeaResponse)
-    print(response)
+EXAMPLE_IDEA = (
+    "We want to build an app for college students that turns their messy "
+    "handwritten notes into digital flashcards for exam prep. We're a team of 3 "
+    "and we have 24 hours. We want to win the Best AI Award and keep everything "
+    "on free-tier tools since we have no budget."
+)
+
+
+async def main() -> None:
+    from a2a_router.server import mount
+
+    app = FastAPI()
+    mount(app, llm=LLM())
+
+    result = await run_pipeline(app, EXAMPLE_IDEA)
+    print(f"\nDone: {len(result.reviews)} reviews, {len(result.debate)} debate rounds, "
+          f"{len(result.reflections)} reflections")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

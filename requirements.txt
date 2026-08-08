@@ -1,8 +1,9 @@
 fastapi
 uvicorn
 pydantic
-litellm
+openai
 python-dotenv
 pydantic-settings
 asyncio
 uuid6
+a2a-sdk[fastapi]
