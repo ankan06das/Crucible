@@ -1,6 +1,7 @@
 import logging
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from a2a_router.server import mount
 from api.routes import router
@@ -15,3 +16,7 @@ app.include_router(router)
 @app.get("/health")
 def status():
     return {"status": "ok"}
+
+# Mount static files at root path
+app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+
