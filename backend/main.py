@@ -22,7 +22,11 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, EmailStr
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+import re
+
 from contextlib import asynccontextmanager
 
 # Add root folder to python path so we can import generator and orchestrator
@@ -106,6 +110,10 @@ async def init_db():
             email TEXT UNIQUE NOT NULL
         )
     """)
+    await c.execute("""
+        ALTER TABLE users 
+        ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'local'
+    """)
     # Projects table
     await c.execute("""
         CREATE TABLE IF NOT EXISTS projects (
@@ -172,12 +180,35 @@ app.add_middleware(
 class RegisterRequest(BaseModel):
     username: str
     password: str
-    email: str
+    email: EmailStr
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+        if not re.search(r"[A-Z]", v):
+            raise ValueError("Password must contain at least one uppercase letter")
+        if not re.search(r"\d", v):
+            raise ValueError("Password must contain at least one number")
+        return v
+
+class GoogleLoginRequest(BaseModel):
+    credential: str
+
+class GoogleRegisterRequest(BaseModel):
+    credential: str
+    username: str
 
 
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class UpdatePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
 
 
 class GenReqWithProject(BaseModel):
@@ -221,6 +252,26 @@ async def get_user_id_from_header(authorization: Optional[str] = Header(None)) -
 
 
 # Auth Endpoints
+@app.get("/api/check-availability")
+async def check_availability(username: Optional[str] = None, email: Optional[str] = None):
+    conn = await get_conn()
+    c = conn.cursor()
+    
+    result = {"username_available": True, "email_available": True}
+    
+    if username:
+        await c.execute("SELECT id FROM users WHERE username = %s", (username,))
+        if await c.fetchone():
+            result["username_available"] = False
+            
+    if email:
+        await c.execute("SELECT id FROM users WHERE email = %s", (email,))
+        if await c.fetchone():
+            result["email_available"] = False
+            
+    await put_conn(conn)
+    return result
+
 @app.post("/api/register")
 async def register(req: RegisterRequest):
     conn = await get_conn()
@@ -228,7 +279,7 @@ async def register(req: RegisterRequest):
     try:
         user_id = str(uuid.uuid4())
         await c.execute(
-            "INSERT INTO users (id, username, password, email) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO users (id, username, password, email, provider) VALUES (%s, %s, %s, %s, 'local')",
             (user_id, req.username, req.password, req.email),
         )
         await conn.commit()
@@ -247,7 +298,7 @@ async def login(req: LoginRequest):
     conn = await get_conn()
     c = conn.cursor()
     await c.execute(
-        "SELECT id, email FROM users WHERE username = %s AND password = %s",
+        "SELECT id, email, provider FROM users WHERE username = %s AND password = %s",
         (req.username, req.password),
     )
     row = await c.fetchone()
@@ -259,12 +310,100 @@ async def login(req: LoginRequest):
         )
     user_id = row[0]
     email = row[1]
+    provider = row[2]
     return {
         "token": f"mock-token-{user_id}",
         "user_id": user_id,
         "username": req.username,
         "email": email,
+        "provider": provider,
     }
+
+@app.post("/api/google-login")
+async def google_login(req: GoogleLoginRequest):
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            req.credential, google_requests.Request(), os.getenv("GOOGLE_CLIENT_ID")
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Google token")
+
+    email = idinfo["email"]
+    
+    conn = await get_conn()
+    c = conn.cursor()
+    await c.execute("SELECT id, username, provider FROM users WHERE email = %s", (email,))
+    row = await c.fetchone()
+    await put_conn(conn)
+    
+    if row:
+        user_id = row[0]
+        username = row[1]
+        provider = row[2]
+        return {
+            "token": f"mock-token-{user_id}",
+            "user_id": user_id,
+            "username": username,
+            "email": email,
+            "provider": provider,
+        }
+    else:
+        return {"requires_username": True, "email": email}
+
+@app.post("/api/google-register")
+async def google_register(req: GoogleRegisterRequest):
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            req.credential, google_requests.Request(), os.getenv("GOOGLE_CLIENT_ID")
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Google token")
+
+    email = idinfo["email"]
+    
+    conn = await get_conn()
+    c = conn.cursor()
+    
+    try:
+        user_id = str(uuid.uuid4())
+        password = str(uuid.uuid4())  # generate random password
+        await c.execute(
+            "INSERT INTO users (id, username, password, email, provider) VALUES (%s, %s, %s, %s, 'google')",
+            (user_id, req.username, password, email),
+        )
+        await conn.commit()
+        return {
+            "token": f"mock-token-{user_id}",
+            "user_id": user_id,
+            "username": req.username,
+            "email": email,
+            "provider": "google",
+        }
+    except IntegrityError:
+        raise HTTPException(
+            status_code=400,
+            detail="Username or email already registered"
+        )
+    finally:
+        await put_conn(conn)
+
+
+@app.put("/api/user/password")
+async def update_password(req: UpdatePasswordRequest, authorization: str = Header(None)):
+    user_id = await get_user_id_from_header(authorization)
+    conn = await get_conn()
+    c = conn.cursor()
+    
+    try:
+        await c.execute("SELECT id FROM users WHERE id = %s AND password = %s", (user_id, req.current_password))
+        if not await c.fetchone():
+             raise HTTPException(status_code=400, detail="Incorrect current password")
+             
+        await c.execute("UPDATE users SET password = %s WHERE id = %s", (req.new_password, user_id))
+        await conn.commit()
+        return {"status": "success"}
+    finally:
+        await put_conn(conn)
 
 
 class UpdateUserRequest(BaseModel):

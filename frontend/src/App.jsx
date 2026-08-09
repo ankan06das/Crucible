@@ -33,10 +33,13 @@ export default function App() {
   // Auth state
   const [token, setToken] = useState(localStorage.getItem("crucible_token") || null);
   const [username, setUsername] = useState(localStorage.getItem("crucible_username") || "");
+  const [email, setEmail] = useState(localStorage.getItem("crucible_email") || "");
+  const [provider, setProvider] = useState(localStorage.getItem("crucible_provider") || "local");
   const [newUsername, setNewUsername] = useState("");
   const [newEmail, setNewEmail] = useState("");
-  const [authMode, setAuthMode] = useState("login"); // login | register
+  const [authMode, setAuthMode] = useState("login"); // login | register | google_setup
   const [authError, setAuthError] = useState("");
+  const [googleCredential, setGoogleCredential] = useState(null);
 
   // App views state
   const [activeTab, setActiveTab] = useState("pathway"); // pathway, refine_form, generate_form, running, dashboard, analytics, config, logs, status, profile, about, contact
@@ -545,8 +548,12 @@ export default function App() {
         const data = await res.json();
         setToken(data.token);
         setUsername(data.username);
+        setEmail(data.email);
+        setProvider(data.provider || "local");
         localStorage.setItem("crucible_token", data.token);
         localStorage.setItem("crucible_username", data.username);
+        localStorage.setItem("crucible_email", data.email);
+        localStorage.setItem("crucible_provider", data.provider || "local");
       } else {
         const data = await res.json();
         setAuthError(data.detail || "Authentication failed");
@@ -562,6 +569,12 @@ export default function App() {
     const userVal = e.target.username.value;
     const passVal = e.target.password.value;
     const emailVal = e.target.email.value;
+
+    if (passVal.length < 8 || !/[A-Z]/.test(passVal) || !/\d/.test(passVal)) {
+      setAuthError("Password must be at least 8 characters long, contain an uppercase letter and a number.");
+      return;
+    }
+
     try {
       const res = await fetch(`${API_BASE}/api/register`, {
         method: "POST",
@@ -580,15 +593,111 @@ export default function App() {
     }
   };
 
+  const handleGoogleSuccess = async (credentialResponse) => {
+    setAuthError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/google-login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credential: credentialResponse.credential })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        if (data.requires_username) {
+          setGoogleCredential(credentialResponse.credential);
+          setAuthMode("google_setup");
+        } else {
+          setToken(data.token);
+          setUsername(data.username);
+          setEmail(data.email);
+          setProvider(data.provider || "google");
+          localStorage.setItem("crucible_token", data.token);
+          localStorage.setItem("crucible_username", data.username);
+          localStorage.setItem("crucible_email", data.email);
+          localStorage.setItem("crucible_provider", data.provider || "google");
+        }
+      } else {
+        setAuthError(data.detail || "Google authentication failed");
+      }
+    } catch (err) {
+      setAuthError("Failed to connect to backend");
+    }
+  };
+
+  const handleGoogleRegister = async (e) => {
+    e.preventDefault();
+    setAuthError("");
+    const userVal = e.target.username.value;
+    try {
+      const res = await fetch(`${API_BASE}/api/google-register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credential: googleCredential, username: userVal })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setToken(data.token);
+        setUsername(data.username);
+        setEmail(data.email);
+        setProvider(data.provider || "google");
+        localStorage.setItem("crucible_token", data.token);
+        localStorage.setItem("crucible_username", data.username);
+        localStorage.setItem("crucible_email", data.email);
+        localStorage.setItem("crucible_provider", data.provider || "google");
+      } else {
+        setAuthError(data.detail || "Google registration failed");
+      }
+    } catch (err) {
+      setAuthError("Failed to connect to backend");
+    }
+  };
+
   const handleLogout = () => {
     setToken(null);
     setUsername("");
+    setEmail("");
+    setProvider("local");
     localStorage.removeItem("crucible_token");
     localStorage.removeItem("crucible_username");
     localStorage.removeItem("crucible_email");
+    localStorage.removeItem("crucible_provider");
     setActiveProject(null);
     setLoadedResult(null);
     setChats([]);
+    setAuthMode("login");
+    setGoogleCredential(null);
+  };
+
+  const handlePasswordUpdate = async (e) => {
+    e.preventDefault();
+    if (newPasscode.length < 8 || !/[A-Z]/.test(newPasscode) || !/\d/.test(newPasscode)) {
+      setPasscodeSuccess("");
+      showNotice("error", "Password must be at least 8 characters long, contain an uppercase letter and a number.");
+      return;
+    }
+    
+    try {
+      const res = await fetch(`${API_BASE}/api/user/password`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ current_password: currentPasscode, new_password: newPasscode })
+      });
+      if (res.ok) {
+        setPasscodeSuccess("Password updated successfully.");
+        setCurrentPasscode("");
+        setNewPasscode("");
+      } else {
+        const data = await res.json();
+        setPasscodeSuccess("");
+        showNotice("error", data.detail || "Failed to update password");
+      }
+    } catch (err) {
+      setPasscodeSuccess("");
+      showNotice("error", "Error connecting to server");
+    }
   };
 
   const handleProfileUpdate = async (e) => {
@@ -1071,6 +1180,8 @@ export default function App() {
     // auth & app state
     token, setToken,
     username, setUsername,
+    email, setEmail,
+    provider, setProvider,
     newUsername, setNewUsername,
     newEmail, setNewEmail,
     authMode, setAuthMode,
@@ -1148,8 +1259,11 @@ export default function App() {
     handleDeleteClick,
     handleLogin,
     handleRegister,
+    handleGoogleSuccess,
+    handleGoogleRegister,
     handleLogout,
     handleProfileUpdate,
+    handlePasswordUpdate,
     appendConsoleLine,
     addAgentLog,
     streamPipeline,

@@ -9,3 +9,5 @@ uuid6
 a2a-sdk[fastapi]
 psycopg[binary]
 psycopg-pool
+google-auth
+email-validator
