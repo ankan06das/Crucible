@@ -14,7 +14,11 @@ graphify-out/
 .opencode
 
 #log files
-generator_pipeline.log
+*.log
 
 #outputs
 outputs
+
+#tests
+tests
+
