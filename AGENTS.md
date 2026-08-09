@@ -23,7 +23,7 @@ Before making implementation decisions, read:
 
 ## Locked-in stack
 
-- Python + **FastAPI** + Pydantic, **SQLite** for persistence, agents run **in parallel** (asyncio). Next.js frontend is Phase 2 / post-MVP.
+- Python + **FastAPI** + Pydantic, **Supabase Postgres** for persistence (via psycopg async pool, `SUPABASE_DATABASE_URL`), agents run **in parallel** (asyncio). Next.js frontend is Phase 2 / post-MVP.
 - Agent panel: Innovation, Feasibility, Impact, Technical, Skeptic. Every stage outputs structured JSON that feeds the next.
 - API contract: `POST /idea`, `GET /idea/{id}`, `POST /idea/{id}/iterate`, `POST /idea/{id}/feedback`.
 

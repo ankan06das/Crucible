@@ -23,13 +23,14 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 
 # Add root folder to python path so we can import generator and orchestrator
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT_DIR))
 sys.path.append(str(Path(__file__).resolve().parent))
 
-from db import get_conn, IntegrityError
+from db import get_conn, put_conn, IntegrityError, close_pool
 
 try:
     from generator import generate_candidates, generate_idea
@@ -85,24 +86,19 @@ async def _run_pipeline_stream(coro_factory, queue: asyncio.Queue):
     finally:
         task.cancel()
 
-app = FastAPI(title="Crucible Backend with SQLite Persistence")
-
-# Enable CORS for React frontend running on dev port
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+    await close_pool()
 
 
 # Database Setup
-def init_db():
-    conn = get_conn()
+async def init_db():
+    conn = await get_conn()
     c = conn.cursor()
     # Users table (with email)
-    c.execute("""
+    await c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
@@ -111,7 +107,7 @@ def init_db():
         )
     """)
     # Projects table
-    c.execute("""
+    await c.execute("""
         CREATE TABLE IF NOT EXISTS projects (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
@@ -122,7 +118,7 @@ def init_db():
         )
     """)
     # Project collaborators table
-    c.execute("""
+    await c.execute("""
         CREATE TABLE IF NOT EXISTS project_collaborators (
             project_id TEXT NOT NULL,
             user_id TEXT NOT NULL,
@@ -133,7 +129,7 @@ def init_db():
         )
     """)
     # Invitations table
-    c.execute("""
+    await c.execute("""
         CREATE TABLE IF NOT EXISTS invitations (
             id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL,
@@ -146,7 +142,7 @@ def init_db():
         )
     """)
     # Chats table
-    c.execute("""
+    await c.execute("""
         CREATE TABLE IF NOT EXISTS chats (
             id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL,
@@ -156,11 +152,20 @@ def init_db():
             FOREIGN KEY (project_id) REFERENCES projects (id)
         )
     """)
-    conn.commit()
-    conn.close()
+    await conn.commit()
+    await put_conn(conn)
 
 
-init_db()
+app = FastAPI(title="Crucible Backend with Supabase Postgres Persistence", lifespan=lifespan)
+
+# Enable CORS for React frontend running on dev port
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # Models
@@ -196,7 +201,7 @@ class RefReqWithProject(BaseModel):
 
 
 # Helpers
-def get_user_id_from_header(authorization: Optional[str] = Header(None)) -> str:
+async def get_user_id_from_header(authorization: Optional[str] = Header(None)) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization Header")
     token = authorization.replace("Bearer ", "").strip()
@@ -205,11 +210,11 @@ def get_user_id_from_header(authorization: Optional[str] = Header(None)) -> str:
         user_id = token.replace("mock-token-", "")
 
     # Validate user exists
-    conn = get_conn()
+    conn = await get_conn()
     c = conn.cursor()
-    c.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
+    await c.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+    row = await c.fetchone()
+    await put_conn(conn)
     if not row:
         raise HTTPException(status_code=401, detail="Invalid token or session expired")
     return user_id
@@ -218,15 +223,15 @@ def get_user_id_from_header(authorization: Optional[str] = Header(None)) -> str:
 # Auth Endpoints
 @app.post("/api/register")
 async def register(req: RegisterRequest):
-    conn = get_conn()
+    conn = await get_conn()
     c = conn.cursor()
     try:
         user_id = str(uuid.uuid4())
-        c.execute(
-            "INSERT INTO users (id, username, password, email) VALUES (?, ?, ?, ?)",
+        await c.execute(
+            "INSERT INTO users (id, username, password, email) VALUES (%s, %s, %s, %s)",
             (user_id, req.username, req.password, req.email),
         )
-        conn.commit()
+        await conn.commit()
         return {"id": user_id, "username": req.username, "email": req.email}
     except IntegrityError:
         raise HTTPException(
@@ -234,19 +239,19 @@ async def register(req: RegisterRequest):
             detail="Username or email already registered"
         )
     finally:
-        conn.close()
+        await put_conn(conn)
 
 
 @app.post("/api/login")
 async def login(req: LoginRequest):
-    conn = get_conn()
+    conn = await get_conn()
     c = conn.cursor()
-    c.execute(
-        "SELECT id, email FROM users WHERE username = ? AND password = ?",
+    await c.execute(
+        "SELECT id, email FROM users WHERE username = %s AND password = %s",
         (req.username, req.password),
     )
-    row = c.fetchone()
-    conn.close()
+    row = await c.fetchone()
+    await put_conn(conn)
     if not row:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -270,34 +275,34 @@ class UpdateUserRequest(BaseModel):
 async def update_user(req: UpdateUserRequest, authorization: str = Header(None)):
     """Update the authenticated user's username and/or email.
     Returns the updated username and email."""
-    user_id = get_user_id_from_header(authorization)
-    conn = get_conn()
+    user_id = await get_user_id_from_header(authorization)
+    conn = await get_conn()
     c = conn.cursor()
     if req.username:
-        c.execute("SELECT id FROM users WHERE username = ? AND id != ?", (req.username, user_id))
-        if c.fetchone():
-            conn.close()
+        await c.execute("SELECT id FROM users WHERE username = %s AND id != %s", (req.username, user_id))
+        if await c.fetchone():
+            await put_conn(conn)
             raise HTTPException(status_code=400, detail="Username already taken")
     if req.email:
-        c.execute("SELECT id FROM users WHERE email = ? AND id != ?", (req.email, user_id))
-        if c.fetchone():
-            conn.close()
+        await c.execute("SELECT id FROM users WHERE email = %s AND id != %s", (req.email, user_id))
+        if await c.fetchone():
+            await put_conn(conn)
             raise HTTPException(status_code=400, detail="Email already registered")
     updates = []
     params = []
     if req.username:
-        updates.append("username = ?")
+        updates.append("username = %s")
         params.append(req.username)
     if req.email:
-        updates.append("email = ?")
+        updates.append("email = %s")
         params.append(req.email)
     params.append(user_id)
     if updates:
-        c.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", tuple(params))
-        conn.commit()
-    c.execute("SELECT username, email FROM users WHERE id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
+        await c.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = %s", tuple(params))
+        await conn.commit()
+    await c.execute("SELECT username, email FROM users WHERE id = %s", (user_id,))
+    row = await c.fetchone()
+    await put_conn(conn)
     return {"username": row[0], "email": row[1]}
 
 # Project Endpoints
@@ -332,18 +337,18 @@ def _project_ideas(project_data_raw: Optional[str]) -> list[dict]:
 
 @app.get("/api/projects")
 async def get_projects(user_id: str = Header(None, alias="Authorization")):
-    resolved_user_id = get_user_id_from_header(user_id)
-    conn = get_conn()
+    resolved_user_id = await get_user_id_from_header(user_id)
+    conn = await get_conn()
     c = conn.cursor()
     # Return solo projects owned by the user (projects with 0 collaborators)
-    c.execute("""
+    await c.execute("""
         SELECT id, name, created_at, project_data FROM projects 
-        WHERE user_id = ? 
+        WHERE user_id = %s 
           AND (SELECT COUNT(*) FROM project_collaborators WHERE project_id = projects.id) = 0
         ORDER BY created_at DESC
     """, (resolved_user_id,))
-    rows = c.fetchall()
-    conn.close()
+    rows = await c.fetchall()
+    await put_conn(conn)
     return [
         {
             "id": row[0],
@@ -357,20 +362,20 @@ async def get_projects(user_id: str = Header(None, alias="Authorization")):
 
 @app.get("/api/projects/collaborations")
 async def get_collaborated_projects(authorization: str = Header(None)):
-    resolved_user_id = get_user_id_from_header(authorization)
-    conn = get_conn()
+    resolved_user_id = await get_user_id_from_header(authorization)
+    conn = await get_conn()
     c = conn.cursor()
     # Return projects where the user is a collaborator OR projects owned by the user that have 1 or more collaborators
-    c.execute("""
+    await c.execute("""
         SELECT DISTINCT p.id, p.name, p.created_at 
         FROM projects p
         LEFT JOIN project_collaborators pc ON p.id = pc.project_id
-        WHERE pc.user_id = ?
-           OR (p.user_id = ? AND (SELECT COUNT(*) FROM project_collaborators pc2 WHERE pc2.project_id = p.id) > 0)
+        WHERE pc.user_id = %s
+           OR (p.user_id = %s AND (SELECT COUNT(*) FROM project_collaborators pc2 WHERE pc2.project_id = p.id) > 0)
         ORDER BY p.created_at DESC
     """, (resolved_user_id, resolved_user_id))
-    rows = c.fetchall()
-    conn.close()
+    rows = await c.fetchall()
+    await put_conn(conn)
     return [
         {"id": row[0], "name": row[1], "created_at": row[2]} for row in rows
     ]
@@ -378,17 +383,17 @@ async def get_collaborated_projects(authorization: str = Header(None)):
 
 @app.get("/api/projects/{project_id}")
 async def get_project(project_id: str, user_id: str = Header(None, alias="Authorization")):
-    resolved_user_id = get_user_id_from_header(user_id)
-    conn = get_conn()
+    resolved_user_id = await get_user_id_from_header(user_id)
+    conn = await get_conn()
     c = conn.cursor()
-    c.execute("""
+    await c.execute("""
         SELECT p.id, p.name, p.created_at, p.project_data, p.user_id 
         FROM projects p
         LEFT JOIN project_collaborators pc ON p.id = pc.project_id
-        WHERE p.id = ? AND (p.user_id = ? OR pc.user_id = ?)
+        WHERE p.id = %s AND (p.user_id = %s OR pc.user_id = %s)
     """, (project_id, resolved_user_id, resolved_user_id))
-    row = c.fetchone()
-    conn.close()
+    row = await c.fetchone()
+    await put_conn(conn)
     if not row:
         raise HTTPException(status_code=404, detail="Project not found or access denied")
 
@@ -404,53 +409,53 @@ async def get_project(project_id: str, user_id: str = Header(None, alias="Author
 
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str, user_id: str = Header(None, alias="Authorization")):
-    resolved_user_id = get_user_id_from_header(user_id)
-    conn = get_conn()
+    resolved_user_id = await get_user_id_from_header(user_id)
+    conn = await get_conn()
     c = conn.cursor()
     # Verify owner or collaborator
-    c.execute("""
+    await c.execute("""
         SELECT p.id 
         FROM projects p
         LEFT JOIN project_collaborators pc ON p.id = pc.project_id
-        WHERE p.id = ? AND (p.user_id = ? OR pc.user_id = ?)
+        WHERE p.id = %s AND (p.user_id = %s OR pc.user_id = %s)
     """, (project_id, resolved_user_id, resolved_user_id))
-    if not c.fetchone():
-        conn.close()
+    if not await c.fetchone():
+        await put_conn(conn)
         raise HTTPException(status_code=403, detail="Access denied or project not found")
 
     # Delete related chats
-    c.execute("DELETE FROM chats WHERE project_id = ?", (project_id,))
+    await c.execute("DELETE FROM chats WHERE project_id = %s", (project_id,))
     # Delete collaborators
-    c.execute("DELETE FROM project_collaborators WHERE project_id = ?", (project_id,))
+    await c.execute("DELETE FROM project_collaborators WHERE project_id = %s", (project_id,))
     # Delete the project itself
-    c.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-    conn.commit()
-    conn.close()
+    await c.execute("DELETE FROM projects WHERE id = %s", (project_id,))
+    await conn.commit()
+    await put_conn(conn)
     return {"detail": "Project deleted successfully"}
 
 
 @app.get("/api/projects/{project_id}/chats")
 async def get_project_chats(project_id: str, user_id: str = Header(None, alias="Authorization")):
-    resolved_user_id = get_user_id_from_header(user_id)
-    conn = get_conn()
+    resolved_user_id = await get_user_id_from_header(user_id)
+    conn = await get_conn()
     c = conn.cursor()
     # Verify owner OR collaborator
-    c.execute("""
+    await c.execute("""
         SELECT p.id 
         FROM projects p
         LEFT JOIN project_collaborators pc ON p.id = pc.project_id
-        WHERE p.id = ? AND (p.user_id = ? OR pc.user_id = ?)
+        WHERE p.id = %s AND (p.user_id = %s OR pc.user_id = %s)
     """, (project_id, resolved_user_id, resolved_user_id))
-    if not c.fetchone():
-        conn.close()
+    if not await c.fetchone():
+        await put_conn(conn)
         raise HTTPException(status_code=403, detail="Access denied or project not found")
 
-    c.execute(
-        "SELECT sender, message, created_at FROM chats WHERE project_id = ? ORDER BY created_at ASC",
+    await c.execute(
+        "SELECT sender, message, created_at FROM chats WHERE project_id = %s ORDER BY created_at ASC",
         (project_id,),
     )
-    rows = c.fetchall()
-    conn.close()
+    rows = await c.fetchall()
+    await put_conn(conn)
     return [
         {"sender": row[0], "message": row[1], "created_at": row[2]}
         for row in rows
@@ -460,7 +465,7 @@ async def get_project_chats(project_id: str, user_id: str = Header(None, alias="
 # Debate / Generation Routing
 @app.post("/idea/generate")
 async def handle_generate(req: GenReqWithProject, request: Request, authorization: str = Header(None)):
-    resolved_user_id = get_user_id_from_header(authorization)
+    resolved_user_id = await get_user_id_from_header(authorization)
     
     # Run the core generation pipeline
     gen_req = GenerationRequest(
@@ -492,10 +497,10 @@ async def handle_generate(req: GenReqWithProject, request: Request, authorizatio
         }
         project_data_json = json.dumps(project_data, default=str)
 
-        conn = get_conn()
+        conn = await get_conn()
         c = conn.cursor()
-        c.execute(
-            "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (?, ?, ?, ?, ?)",
+        await c.execute(
+            "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (%s, %s, %s, %s, %s)",
             (project_id, resolved_user_id, req.project_name, created_at, project_data_json),
         )
 
@@ -509,12 +514,12 @@ async def handle_generate(req: GenReqWithProject, request: Request, authorizatio
                     elif hasattr(stance_val, "value"):
                         stance_val = stance_val.value
                     message_text = f"Debated {reply.get('reply_to', '')} ({stance_val}): {reply.get('argument', '')}"
-                    c.execute(
-                        "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
+                    await c.execute(
+                        "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (%s, %s, %s, %s, %s)",
                         (msg_id, project_id, agent, message_text, created_at),
                     )
-        conn.commit()
-        conn.close()
+        await conn.commit()
+        await put_conn(conn)
 
         await emit({
             "type": "complete",
@@ -538,26 +543,26 @@ class SelectCandidateRequest(BaseModel):
 
 @app.post("/api/projects/{project_id}/select-candidate")
 async def select_candidate(project_id: str, req: SelectCandidateRequest, request: Request, authorization: str = Header(None)):
-    resolved_user_id = get_user_id_from_header(authorization)
+    resolved_user_id = await get_user_id_from_header(authorization)
     
-    conn = get_conn()
+    conn = await get_conn()
     c = conn.cursor()
     
     # Verify owner OR collaborator
-    c.execute("""
+    await c.execute("""
         SELECT p.project_data, p.name 
         FROM projects p
         LEFT JOIN project_collaborators pc ON p.id = pc.project_id
-        WHERE p.id = ? AND (p.user_id = ? OR pc.user_id = ?)
+        WHERE p.id = %s AND (p.user_id = %s OR pc.user_id = %s)
     """, (project_id, resolved_user_id, resolved_user_id))
-    row = c.fetchone()
+    row = await c.fetchone()
     if not row:
-        conn.close()
+        await put_conn(conn)
         raise HTTPException(status_code=404, detail="Project not found or access denied")
         
     project_data = json.loads(row[0]) if row[0] else {}
     project_name = row[1]
-    conn.close()
+    await put_conn(conn)
 
     context = project_data.get("context", "")
 
@@ -575,14 +580,14 @@ async def select_candidate(project_id: str, req: SelectCandidateRequest, request
             "research": {k: v.model_dump() for k, v in result.research.items()},
         }
 
-        conn = get_conn()
+        conn = await get_conn()
         c = conn.cursor()
         project_data["status"] = "active"
         project_data["selected_candidate"] = {"title": req.title, "idea": req.idea}
         project_data["refinement"] = res_dict
         project_data_json = json.dumps(project_data, default=str)
-        c.execute(
-            "UPDATE projects SET project_data = ? WHERE id = ?",
+        await c.execute(
+            "UPDATE projects SET project_data = %s WHERE id = %s",
             (project_data_json, project_id)
         )
 
@@ -592,12 +597,12 @@ async def select_candidate(project_id: str, req: SelectCandidateRequest, request
                 for reply in round_data.root:
                     msg_id = str(uuid.uuid4())
                     message_text = f"Debated {reply.reply_to} ({reply.stance.value}): {reply.argument}"
-                    c.execute(
-                        "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
+                    await c.execute(
+                        "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (%s, %s, %s, %s, %s)",
                         (msg_id, project_id, agent, message_text, created_at),
                     )
-        conn.commit()
-        conn.close()
+        await conn.commit()
+        await put_conn(conn)
 
         await emit({"type": "complete", "project_id": project_id, "project_name": project_name})
 
@@ -610,7 +615,7 @@ async def select_candidate(project_id: str, req: SelectCandidateRequest, request
 
 @app.post("/idea/refine")
 async def handle_refine(req: RefReqWithProject, request: Request, authorization: str = Header(None)):
-    resolved_user_id = get_user_id_from_header(authorization)
+    resolved_user_id = await get_user_id_from_header(authorization)
     
     context_parts = []
     if req.theme:
@@ -640,19 +645,19 @@ async def handle_refine(req: RefReqWithProject, request: Request, authorization:
         project_id = req.project_id or str(uuid.uuid4())
         project_data = {}
 
-        conn = get_conn()
+        conn = await get_conn()
         c = conn.cursor()
 
         # When iterating an existing idea (project_id provided), append a new
         # version to the SAME project instead of creating a brand-new one.
         if req.project_id:
-            c.execute(
-                "SELECT project_data, name FROM projects WHERE id = ? AND user_id = ?",
+            await c.execute(
+                "SELECT project_data, name FROM projects WHERE id = %s AND user_id = %s",
                 (req.project_id, resolved_user_id),
             )
-            row = c.fetchone()
+            row = await c.fetchone()
             if not row:
-                conn.close()
+                await put_conn(conn)
                 raise HTTPException(status_code=404, detail="Project not found or access denied")
             project_data = json.loads(row[0]) if row[0] else {}
             if not req.project_name:
@@ -697,13 +702,13 @@ async def handle_refine(req: RefReqWithProject, request: Request, authorization:
         project_data_json = json.dumps(project_data, default=str)
 
         if req.project_id:
-            c.execute(
-                "UPDATE projects SET project_data = ?, name = ? WHERE id = ?",
+            await c.execute(
+                "UPDATE projects SET project_data = %s, name = %s WHERE id = %s",
                 (project_data_json, req.project_name, project_id),
             )
         else:
-            c.execute(
-                "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (?, ?, ?, ?, ?)",
+            await c.execute(
+                "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (%s, %s, %s, %s, %s)",
                 (project_id, resolved_user_id, req.project_name, created_at, project_data_json),
             )
 
@@ -712,13 +717,13 @@ async def handle_refine(req: RefReqWithProject, request: Request, authorization:
                 for reply in round_data.root:
                     msg_id = str(uuid.uuid4())
                     message_text = f"Debated {reply.reply_to} ({reply.stance.value}): {reply.argument}"
-                    c.execute(
-                        "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
+                    await c.execute(
+                        "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (%s, %s, %s, %s, %s)",
                         (msg_id, project_id, agent, message_text, created_at),
                     )
 
-        conn.commit()
-        conn.close()
+        await conn.commit()
+        await put_conn(conn)
 
         await emit({
             "type": "complete",
@@ -815,22 +820,22 @@ Response:"""
 
 @app.post("/api/projects/{project_id}/chat")
 async def chat_with_agent(project_id: str, req: ChatAgentRequest, authorization: str = Header(None)):
-    resolved_user_id = get_user_id_from_header(authorization)
+    resolved_user_id = await get_user_id_from_header(authorization)
     
-    conn = get_conn()
+    conn = await get_conn()
     c = conn.cursor()
     
     # 1. Verify access (owner OR collaborator)
-    c.execute("""
+    await c.execute("""
         SELECT p.project_data, u.username 
         FROM projects p
-        JOIN users u ON u.id = ?
+        JOIN users u ON u.id = %s
         LEFT JOIN project_collaborators pc ON p.id = pc.project_id
-        WHERE p.id = ? AND (p.user_id = ? OR pc.user_id = ?)
+        WHERE p.id = %s AND (p.user_id = %s OR pc.user_id = %s)
     """, (resolved_user_id, project_id, resolved_user_id, resolved_user_id))
-    row = c.fetchone()
+    row = await c.fetchone()
     if not row:
-        conn.close()
+        await put_conn(conn)
         raise HTTPException(status_code=404, detail="Project not found or access denied")
         
     project_data = json.loads(row[0]) if row[0] else {}
@@ -844,24 +849,24 @@ async def chat_with_agent(project_id: str, req: ChatAgentRequest, authorization:
         idea = project_data.get("idea", "")
         
     # 3. Load chat history
-    c.execute("""
+    await c.execute("""
         SELECT sender, message 
         FROM chats 
-        WHERE project_id = ? 
+        WHERE project_id = %s 
         ORDER BY created_at ASC
     """, (project_id,))
-    chat_rows = c.fetchall()
+    chat_rows = await c.fetchall()
     chat_history = [{"sender": r[0], "message": r[1]} for r in chat_rows]
     
     # 4. Insert user message in database
     created_at = datetime.datetime.utcnow().isoformat()
     user_msg_id = str(uuid.uuid4())
-    c.execute("""
+    await c.execute("""
         INSERT INTO chats (id, project_id, sender, message, created_at)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s)
     """, (user_msg_id, project_id, username, req.message, created_at))
-    conn.commit()
-    conn.close()
+    await conn.commit()
+    await put_conn(conn)
 
     # 5. Format agent prompt and stream the reply token-by-token
     prompt = get_agent_response_prompt(req.recipient, idea, project_data, chat_history, req.message)
@@ -885,15 +890,15 @@ async def chat_with_agent(project_id: str, req: ChatAgentRequest, authorization:
 
         # 6. Persist agent response once streaming completes
         agent_reply = "".join(chunks)
-        conn = get_conn()
+        conn = await get_conn()
         c = conn.cursor()
         agent_msg_id = str(uuid.uuid4())
-        c.execute("""
+        await c.execute("""
             INSERT INTO chats (id, project_id, sender, message, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
         """, (agent_msg_id, project_id, agent_display_name, agent_reply, created_at))
-        conn.commit()
-        conn.close()
+        await conn.commit()
+        await put_conn(conn)
 
         yield _sse_event("agent_done", {
             "sender": agent_display_name,
@@ -993,36 +998,36 @@ async def invite_collaborator(
     background_tasks: BackgroundTasks,
     authorization: str = Header(None)
 ):
-    resolved_user_id = get_user_id_from_header(authorization)
+    resolved_user_id = await get_user_id_from_header(authorization)
     
-    conn = get_conn()
+    conn = await get_conn()
     c = conn.cursor()
     
     # 1. Verify that the logged-in user is either the owner or a collaborator
-    c.execute("""
+    await c.execute("""
         SELECT p.id, p.name 
         FROM projects p
         LEFT JOIN project_collaborators pc ON p.id = pc.project_id
-        WHERE p.id = ? AND (p.user_id = ? OR pc.user_id = ?)
+        WHERE p.id = %s AND (p.user_id = %s OR pc.user_id = %s)
     """, (project_id, resolved_user_id, resolved_user_id))
-    project_row = c.fetchone()
+    project_row = await c.fetchone()
     if not project_row:
-        conn.close()
+        await put_conn(conn)
         raise HTTPException(status_code=403, detail="Access denied or project not found")
         
     project_name = project_row[1]
 
     # Get sender username and email
-    c.execute("SELECT username, email FROM users WHERE id = ?", (resolved_user_id,))
-    sender_row = c.fetchone()
+    await c.execute("SELECT username, email FROM users WHERE id = %s", (resolved_user_id,))
+    sender_row = await c.fetchone()
     sender_username = sender_row[0] if sender_row else "An Operator"
     sender_email = sender_row[1] if sender_row else ""
 
     # 2. Find target user by email
-    c.execute("SELECT id, username FROM users WHERE email = ?", (req.email,))
-    invitee_row = c.fetchone()
+    await c.execute("SELECT id, username FROM users WHERE email = %s", (req.email,))
+    invitee_row = await c.fetchone()
     if not invitee_row:
-        conn.close()
+        await put_conn(conn)
         raise HTTPException(status_code=404, detail="Operator with this email not registered yet")
         
     invitee_id = invitee_row[0]
@@ -1030,24 +1035,24 @@ async def invite_collaborator(
     
     # 3. Prevent self-invitation
     if invitee_id == resolved_user_id:
-        conn.close()
+        await put_conn(conn)
         raise HTTPException(status_code=400, detail="You cannot invite yourself")
         
     # 4. Check if already a collaborator
-    c.execute("SELECT user_id FROM project_collaborators WHERE project_id = ? AND user_id = ?", (project_id, invitee_id))
-    if c.fetchone():
-        conn.close()
+    await c.execute("SELECT user_id FROM project_collaborators WHERE project_id = %s AND user_id = %s", (project_id, invitee_id))
+    if await c.fetchone():
+        await put_conn(conn)
         raise HTTPException(status_code=400, detail="This operator is already a collaborator on this project")
         
     # 5. Check if invitation already pending (allow resending)
-    c.execute("SELECT id FROM invitations WHERE project_id = ? AND invitee_email = ? AND status = 'pending'", (project_id, req.email))
-    existing_invite = c.fetchone()
+    await c.execute("SELECT id FROM invitations WHERE project_id = %s AND invitee_email = %s AND status = 'pending'", (project_id, req.email))
+    existing_invite = await c.fetchone()
     if existing_invite:
         invite_id = existing_invite[0]
         created_at = datetime.datetime.utcnow().isoformat()
-        c.execute("UPDATE invitations SET created_at = ? WHERE id = ?", (created_at, invite_id))
-        conn.commit()
-        conn.close()
+        await c.execute("UPDATE invitations SET created_at = %s WHERE id = %s", (created_at, invite_id))
+        await conn.commit()
+        await put_conn(conn)
         
         frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:5173")
         invite_link = f"{frontend_url}?accept_invite={invite_id}"
@@ -1067,13 +1072,13 @@ async def invite_collaborator(
     # 6. Create invitation
     invite_id = str(uuid.uuid4())
     created_at = datetime.datetime.utcnow().isoformat()
-    c.execute("""
+    await c.execute("""
         INSERT INTO invitations (id, project_id, sender_id, invitee_email, status, created_at)
-        VALUES (?, ?, ?, ?, 'pending', ?)
+        VALUES (%s, %s, %s, %s, 'pending', %s)
     """, (invite_id, project_id, resolved_user_id, req.email, created_at))
     
-    conn.commit()
-    conn.close()
+    await conn.commit()
+    await put_conn(conn)
     
     frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:5173")
     invite_link = f"{frontend_url}?accept_invite={invite_id}"
@@ -1094,31 +1099,31 @@ async def invite_collaborator(
 
 @app.get("/api/invitations")
 async def get_invitations(authorization: str = Header(None)):
-    resolved_user_id = get_user_id_from_header(authorization)
+    resolved_user_id = await get_user_id_from_header(authorization)
     
-    conn = get_conn()
+    conn = await get_conn()
     c = conn.cursor()
     
     # Find user email first
-    c.execute("SELECT email FROM users WHERE id = ?", (resolved_user_id,))
-    email_row = c.fetchone()
+    await c.execute("SELECT email FROM users WHERE id = %s", (resolved_user_id,))
+    email_row = await c.fetchone()
     if not email_row:
-        conn.close()
+        await put_conn(conn)
         raise HTTPException(status_code=404, detail="User email not found")
         
     user_email = email_row[0]
     
     # Select pending invitations for this email
-    c.execute("""
+    await c.execute("""
         SELECT i.id, i.project_id, p.name, u.username, i.created_at
         FROM invitations i
         JOIN projects p ON i.project_id = p.id
         JOIN users u ON i.sender_id = u.id
-        WHERE i.invitee_email = ? AND i.status = 'pending'
+        WHERE i.invitee_email = %s AND i.status = 'pending'
         ORDER BY i.created_at DESC
     """, (user_email,))
-    rows = c.fetchall()
-    conn.close()
+    rows = await c.fetchall()
+    await put_conn(conn)
     
     return [
         {
@@ -1138,85 +1143,86 @@ class RespondInvitationRequest(BaseModel):
 
 @app.post("/api/invitations/{invitation_id}/respond")
 async def respond_invitation(invitation_id: str, req: RespondInvitationRequest, authorization: str = Header(None)):
-    resolved_user_id = get_user_id_from_header(authorization)
+    resolved_user_id = await get_user_id_from_header(authorization)
     
-    conn = get_conn()
+    conn = await get_conn()
     c = conn.cursor()
     
     # Load invitation
-    c.execute("SELECT project_id, invitee_email, status FROM invitations WHERE id = ?", (invitation_id,))
-    inv_row = c.fetchone()
+    await c.execute("SELECT project_id, invitee_email, status FROM invitations WHERE id = %s", (invitation_id,))
+    inv_row = await c.fetchone()
     if not inv_row:
-        conn.close()
+        await put_conn(conn)
         raise HTTPException(status_code=404, detail="Invitation not found")
         
     project_id, invitee_email, status = inv_row
     
     # Verify invitation is pending
     if status != 'pending':
-        conn.close()
+        await put_conn(conn)
         raise HTTPException(status_code=400, detail="Invitation already processed")
         
     # Verify the logged-in user's email matches the invitee_email
-    c.execute("SELECT email FROM users WHERE id = ?", (resolved_user_id,))
-    email_row = c.fetchone()
+    await c.execute("SELECT email FROM users WHERE id = %s", (resolved_user_id,))
+    email_row = await c.fetchone()
     if not email_row or email_row[0] != invitee_email:
-        conn.close()
+        await put_conn(conn)
         raise HTTPException(status_code=403, detail="Access denied: invitation email mismatch")
         
     # Process response
     new_status = 'accepted' if req.response == 'accept' else 'declined'
-    c.execute("UPDATE invitations SET status = ? WHERE id = ?", (new_status, invitation_id))
+    await c.execute("UPDATE invitations SET status = %s WHERE id = %s", (new_status, invitation_id))
     
     if new_status == 'accepted':
         joined_at = datetime.datetime.utcnow().isoformat()
-        c.execute("""
-            INSERT OR IGNORE INTO project_collaborators (project_id, user_id, joined_at)
-            VALUES (?, ?, ?)
+        await c.execute("""
+            INSERT INTO project_collaborators (project_id, user_id, joined_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (project_id, user_id) DO NOTHING
         """, (project_id, resolved_user_id, joined_at))
         
-    conn.commit()
-    conn.close()
+    await conn.commit()
+    await put_conn(conn)
     return {"message": f"Invitation {new_status}."}
 
 
 @app.get("/api/projects/{project_id}/collaborators")
 async def get_project_collaborators(project_id: str, authorization: str = Header(None)):
-    resolved_user_id = get_user_id_from_header(authorization)
+    resolved_user_id = await get_user_id_from_header(authorization)
     
-    conn = get_conn()
+    conn = await get_conn()
     c = conn.cursor()
     
     # Verify owner OR collaborator
-    c.execute("""
+    await c.execute("""
         SELECT p.id, p.user_id 
         FROM projects p
         LEFT JOIN project_collaborators pc ON p.id = pc.project_id
-        WHERE p.id = ? AND (p.user_id = ? OR pc.user_id = ?)
+        WHERE p.id = %s AND (p.user_id = %s OR pc.user_id = %s)
     """, (project_id, resolved_user_id, resolved_user_id))
-    if not c.fetchone():
-        conn.close()
+    if not await c.fetchone():
+        await put_conn(conn)
         raise HTTPException(status_code=403, detail="Access denied or project not found")
         
     # Get owner info
-    c.execute("""
+    await c.execute("""
         SELECT u.username, u.email 
         FROM projects p
         JOIN users u ON p.user_id = u.id
-        WHERE p.id = ?
+        WHERE p.id = %s
     """, (project_id,))
-    owner_row = c.fetchone()
+    owner_row = await c.fetchone()
     owner = {"username": owner_row[0], "email": owner_row[1], "role": "owner"} if owner_row else None
     
     # Get collaborators
-    c.execute("""
+    await c.execute("""
         SELECT u.username, u.email 
         FROM project_collaborators pc
         JOIN users u ON pc.user_id = u.id
-        WHERE pc.project_id = ?
+        WHERE pc.project_id = %s
     """, (project_id,))
-    rows = c.fetchall()
-    conn.close()
+    rows = await c.fetchall()
+    await put_conn(conn)
     
     collaborators = [
         {"username": row[0], "email": row[1], "role": "collaborator"}
