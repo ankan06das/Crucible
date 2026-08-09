@@ -7,3 +7,4 @@ pydantic-settings
 asyncio
 uuid6
 a2a-sdk[fastapi]
+libsql-experimental

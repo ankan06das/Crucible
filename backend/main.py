@@ -1,24 +1,35 @@
-import sys
 import os
-from dotenv import load_dotenv
-load_dotenv()
-import json
-import sqlite3
-import uuid
-import datetime
-from pathlib import Path
-from typing import List, Dict, Any, Optional
+import sys
 
-from fastapi import FastAPI, Header, HTTPException, Request, status, BackgroundTasks
+from dotenv import load_dotenv
+
+load_dotenv()
+import datetime
+import json
+import smtplib
+import uuid
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+from typing import List, Optional  # noqa: UP035
+
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 # Add root folder to python path so we can import generator and orchestrator
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT_DIR))
+sys.path.append(str(Path(__file__).resolve().parent))
+
+from db import get_conn, IntegrityError
 
 try:
     from generator import generate_candidates, generate_idea
@@ -33,6 +44,7 @@ except ModuleNotFoundError:
     GenerationResult = None
 
 import asyncio
+
 from fastapi.responses import StreamingResponse
 
 # --- Server-Sent Events helpers ------------------------------------------------
@@ -73,8 +85,6 @@ async def _run_pipeline_stream(coro_factory, queue: asyncio.Queue):
     finally:
         task.cancel()
 
-DB_FILE = Path(__file__).parent / "crucible.db"
-
 app = FastAPI(title="Crucible Backend with SQLite Persistence")
 
 # Enable CORS for React frontend running on dev port
@@ -89,7 +99,7 @@ app.add_middleware(
 
 # Database Setup
 def init_db():
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     # Users table (with email)
     c.execute("""
@@ -195,7 +205,7 @@ def get_user_id_from_header(authorization: Optional[str] = Header(None)) -> str:
         user_id = token.replace("mock-token-", "")
 
     # Validate user exists
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id FROM users WHERE id = ?", (user_id,))
     row = c.fetchone()
@@ -208,7 +218,7 @@ def get_user_id_from_header(authorization: Optional[str] = Header(None)) -> str:
 # Auth Endpoints
 @app.post("/api/register")
 async def register(req: RegisterRequest):
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     try:
         user_id = str(uuid.uuid4())
@@ -218,7 +228,7 @@ async def register(req: RegisterRequest):
         )
         conn.commit()
         return {"id": user_id, "username": req.username, "email": req.email}
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         raise HTTPException(
             status_code=400,
             detail="Username or email already registered"
@@ -229,7 +239,7 @@ async def register(req: RegisterRequest):
 
 @app.post("/api/login")
 async def login(req: LoginRequest):
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     c.execute(
         "SELECT id, email FROM users WHERE username = ? AND password = ?",
@@ -261,7 +271,7 @@ async def update_user(req: UpdateUserRequest, authorization: str = Header(None))
     """Update the authenticated user's username and/or email.
     Returns the updated username and email."""
     user_id = get_user_id_from_header(authorization)
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     if req.username:
         c.execute("SELECT id FROM users WHERE username = ? AND id != ?", (req.username, user_id))
@@ -323,7 +333,7 @@ def _project_ideas(project_data_raw: Optional[str]) -> list[dict]:
 @app.get("/api/projects")
 async def get_projects(user_id: str = Header(None, alias="Authorization")):
     resolved_user_id = get_user_id_from_header(user_id)
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     # Return solo projects owned by the user (projects with 0 collaborators)
     c.execute("""
@@ -348,7 +358,7 @@ async def get_projects(user_id: str = Header(None, alias="Authorization")):
 @app.get("/api/projects/collaborations")
 async def get_collaborated_projects(authorization: str = Header(None)):
     resolved_user_id = get_user_id_from_header(authorization)
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     # Return projects where the user is a collaborator OR projects owned by the user that have 1 or more collaborators
     c.execute("""
@@ -369,7 +379,7 @@ async def get_collaborated_projects(authorization: str = Header(None)):
 @app.get("/api/projects/{project_id}")
 async def get_project(project_id: str, user_id: str = Header(None, alias="Authorization")):
     resolved_user_id = get_user_id_from_header(user_id)
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     c.execute("""
         SELECT p.id, p.name, p.created_at, p.project_data, p.user_id 
@@ -395,7 +405,7 @@ async def get_project(project_id: str, user_id: str = Header(None, alias="Author
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str, user_id: str = Header(None, alias="Authorization")):
     resolved_user_id = get_user_id_from_header(user_id)
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     # Verify owner or collaborator
     c.execute("""
@@ -422,7 +432,7 @@ async def delete_project(project_id: str, user_id: str = Header(None, alias="Aut
 @app.get("/api/projects/{project_id}/chats")
 async def get_project_chats(project_id: str, user_id: str = Header(None, alias="Authorization")):
     resolved_user_id = get_user_id_from_header(user_id)
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     # Verify owner OR collaborator
     c.execute("""
@@ -482,7 +492,7 @@ async def handle_generate(req: GenReqWithProject, request: Request, authorizatio
         }
         project_data_json = json.dumps(project_data, default=str)
 
-        conn = sqlite3.connect(str(DB_FILE))
+        conn = get_conn()
         c = conn.cursor()
         c.execute(
             "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (?, ?, ?, ?, ?)",
@@ -530,7 +540,7 @@ class SelectCandidateRequest(BaseModel):
 async def select_candidate(project_id: str, req: SelectCandidateRequest, request: Request, authorization: str = Header(None)):
     resolved_user_id = get_user_id_from_header(authorization)
     
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     
     # Verify owner OR collaborator
@@ -565,7 +575,7 @@ async def select_candidate(project_id: str, req: SelectCandidateRequest, request
             "research": {k: v.model_dump() for k, v in result.research.items()},
         }
 
-        conn = sqlite3.connect(str(DB_FILE))
+        conn = get_conn()
         c = conn.cursor()
         project_data["status"] = "active"
         project_data["selected_candidate"] = {"title": req.title, "idea": req.idea}
@@ -630,7 +640,7 @@ async def handle_refine(req: RefReqWithProject, request: Request, authorization:
         project_id = req.project_id or str(uuid.uuid4())
         project_data = {}
 
-        conn = sqlite3.connect(str(DB_FILE))
+        conn = get_conn()
         c = conn.cursor()
 
         # When iterating an existing idea (project_id provided), append a new
@@ -807,7 +817,7 @@ Response:"""
 async def chat_with_agent(project_id: str, req: ChatAgentRequest, authorization: str = Header(None)):
     resolved_user_id = get_user_id_from_header(authorization)
     
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     
     # 1. Verify access (owner OR collaborator)
@@ -875,7 +885,7 @@ async def chat_with_agent(project_id: str, req: ChatAgentRequest, authorization:
 
         # 6. Persist agent response once streaming completes
         agent_reply = "".join(chunks)
-        conn = sqlite3.connect(str(DB_FILE))
+        conn = get_conn()
         c = conn.cursor()
         agent_msg_id = str(uuid.uuid4())
         c.execute("""
@@ -985,7 +995,7 @@ async def invite_collaborator(
 ):
     resolved_user_id = get_user_id_from_header(authorization)
     
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     
     # 1. Verify that the logged-in user is either the owner or a collaborator
@@ -1086,7 +1096,7 @@ async def invite_collaborator(
 async def get_invitations(authorization: str = Header(None)):
     resolved_user_id = get_user_id_from_header(authorization)
     
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     
     # Find user email first
@@ -1130,7 +1140,7 @@ class RespondInvitationRequest(BaseModel):
 async def respond_invitation(invitation_id: str, req: RespondInvitationRequest, authorization: str = Header(None)):
     resolved_user_id = get_user_id_from_header(authorization)
     
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     
     # Load invitation
@@ -1174,7 +1184,7 @@ async def respond_invitation(invitation_id: str, req: RespondInvitationRequest, 
 async def get_project_collaborators(project_id: str, authorization: str = Header(None)):
     resolved_user_id = get_user_id_from_header(authorization)
     
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = get_conn()
     c = conn.cursor()
     
     # Verify owner OR collaborator
