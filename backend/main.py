@@ -1,5 +1,7 @@
 import sys
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import json
 import sqlite3
 import uuid
@@ -7,9 +9,12 @@ import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi import FastAPI, Header, HTTPException, Request, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # Add root folder to python path so we can import generator and orchestrator
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -26,6 +31,37 @@ except ModuleNotFoundError:
     run_pipeline = None
     GenerationRequest = None
     GenerationResult = None
+
+import io
+import asyncio
+import contextlib
+from fastapi.responses import StreamingResponse
+
+class QueueWriter(io.StringIO):
+    def __init__(self, queue: asyncio.Queue, original_stdout):
+        super().__init__()
+        self.queue = queue
+        self.original_stdout = original_stdout
+
+    def write(self, s: str):
+        self.original_stdout.write(s)
+        self.original_stdout.flush()
+        if s.strip():
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_soon_threadsafe(self.queue.put_nowait, s.strip())
+            except RuntimeError:
+                pass
+
+@contextlib.contextmanager
+def redirect_stdout_to_queue(queue: asyncio.Queue):
+    original_stdout = sys.stdout
+    writer = QueueWriter(queue, original_stdout)
+    sys.stdout = writer
+    try:
+        yield
+    finally:
+        sys.stdout = original_stdout
 
 DB_FILE = Path(__file__).parent / "crucible.db"
 
@@ -136,6 +172,7 @@ class RefReqWithProject(BaseModel):
     theme: Optional[str] = None
     team_size: Optional[int] = None
     time_hours: Optional[int] = None
+    project_id: Optional[str] = None
 
 
 # Helpers
@@ -244,15 +281,74 @@ async def update_user(req: UpdateUserRequest, authorization: str = Header(None))
     return {"username": row[0], "email": row[1]}
 
 # Project Endpoints
+def _project_ideas(project_data_raw: Optional[str]) -> list[dict]:
+    """Extract a browsable idea list (candidates + refinement versions) from a project."""
+    try:
+        project_data = json.loads(project_data_raw) if project_data_raw else {}
+    except (json.JSONDecodeError, TypeError):
+        project_data = {}
+    ideas: list[dict] = []
+
+    candidates = project_data.get("candidates")
+    if isinstance(candidates, list):
+        for idx, cand in enumerate(candidates):
+            if isinstance(cand, dict):
+                title = cand.get("title") or f"Idea #{idx + 1}"
+                ideas.append({"type": "candidate", "idx": idx, "label": f"Idea #{idx + 1}: {title}", "title": title})
+
+    versions = project_data.get("versions")
+    if isinstance(versions, list):
+        for v in versions:
+            if isinstance(v, dict):
+                vn = v.get("version") or 1
+                title = ""
+                mod = v.get("moderator")
+                if isinstance(mod, dict):
+                    title = mod.get("refined_idea") or mod.get("title") or ""
+                ideas.append({"type": "version", "idx": (vn - 1) if vn >= 1 else 0, "label": f"Version {vn}", "title": title})
+
+    return ideas
+
+
 @app.get("/api/projects")
 async def get_projects(user_id: str = Header(None, alias="Authorization")):
     resolved_user_id = get_user_id_from_header(user_id)
     conn = sqlite3.connect(str(DB_FILE))
     c = conn.cursor()
-    c.execute(
-        "SELECT id, name, created_at FROM projects WHERE user_id = ? ORDER BY created_at DESC",
-        (resolved_user_id,),
-    )
+    # Return solo projects owned by the user (projects with 0 collaborators)
+    c.execute("""
+        SELECT id, name, created_at, project_data FROM projects 
+        WHERE user_id = ? 
+          AND (SELECT COUNT(*) FROM project_collaborators WHERE project_id = projects.id) = 0
+        ORDER BY created_at DESC
+    """, (resolved_user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {
+            "id": row[0],
+            "name": row[1],
+            "created_at": row[2],
+            "ideas": _project_ideas(row[3]),
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/projects/collaborations")
+async def get_collaborated_projects(authorization: str = Header(None)):
+    resolved_user_id = get_user_id_from_header(authorization)
+    conn = sqlite3.connect(str(DB_FILE))
+    c = conn.cursor()
+    # Return projects where the user is a collaborator OR projects owned by the user that have 1 or more collaborators
+    c.execute("""
+        SELECT DISTINCT p.id, p.name, p.created_at 
+        FROM projects p
+        LEFT JOIN project_collaborators pc ON p.id = pc.project_id
+        WHERE pc.user_id = ?
+           OR (p.user_id = ? AND (SELECT COUNT(*) FROM project_collaborators pc2 WHERE pc2.project_id = p.id) > 0)
+        ORDER BY p.created_at DESC
+    """, (resolved_user_id, resolved_user_id))
     rows = c.fetchall()
     conn.close()
     return [
@@ -356,55 +452,84 @@ async def handle_generate(req: GenReqWithProject, request: Request, authorizatio
         constraints=req.constraints,
         urls=req.urls,
     )
-    result = await generate_candidates(request.app, gen_req)
 
-    # Save to SQLite Projects
-    project_id = str(uuid.uuid4())
-    created_at = datetime.datetime.utcnow().isoformat()
-    
-    # Save with status pending_selection
-    project_data = {
-        "status": "pending_selection",
-        "candidates": result.get("candidates", []),
-        "research": result.get("research", None),
-        "proposals": result.get("proposals", {}),
-        "debates": result.get("debates", {}),
-        "context": result.get("context", "")
-    }
-    project_data_json = json.dumps(project_data, default=str)
+    async def sse_generator():
+        queue = asyncio.Queue()
+        async def run_pipeline_task():
+            with redirect_stdout_to_queue(queue):
+                result = await generate_candidates(request.app, gen_req)
+            return result
 
-    conn = sqlite3.connect(str(DB_FILE))
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (?, ?, ?, ?, ?)",
-        (project_id, resolved_user_id, req.project_name, created_at, project_data_json),
-    )
+        task = asyncio.create_task(run_pipeline_task())
+        while not task.done() or not queue.empty():
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=0.1)
+                if isinstance(item, Exception):
+                    yield f"data: {json.dumps({'type': 'log', 'text': f'[ERROR] {str(item)}', 'agent': 'SYSTEM'})}\n\n"
+                    break
+                agent = "SYSTEM"
+                text = item
+                for possible_agent in ["Innovation", "Feasibility", "Impact", "Technical", "Skeptic", "Moderator", "Ideator", "Researcher", "Strategist"]:
+                    if possible_agent.lower() in item.lower():
+                        agent = f"{possible_agent} Agent"
+                        break
+                yield f"data: {json.dumps({'type': 'log', 'text': text, 'agent': agent})}\n\n"
+                queue.task_done()
+            except asyncio.TimeoutError:
+                continue
 
-    # Extract debates and save to chats table (optional, but good for tracking)
-    for agent, round_data in result.get("debates", {}).items():
-        if round_data and "root" in round_data:
-            for reply in round_data["root"]:
-                msg_id = str(uuid.uuid4())
-                stance_val = reply.get("stance", "neutral")
-                if isinstance(stance_val, dict) and "value" in stance_val:
-                    stance_val = stance_val["value"]
-                elif hasattr(stance_val, "value"):
-                    stance_val = stance_val.value
-                message_text = f"Debated {reply.get('reply_to', '')} ({stance_val}): {reply.get('argument', '')}"
-                c.execute(
-                    "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (msg_id, project_id, agent, message_text, created_at),
-                )
-    
-    conn.commit()
-    conn.close()
+        try:
+            result = await task
+            # Save to SQLite Projects
+            project_id = str(uuid.uuid4())
+            created_at = datetime.datetime.utcnow().isoformat()
+            
+            project_data = {
+                "status": "pending_selection",
+                "candidates": result.get("candidates", []),
+                "research": result.get("research", None),
+                "proposals": result.get("proposals", {}),
+                "debates": result.get("debates", {}),
+                "context": result.get("context", "")
+            }
+            project_data_json = json.dumps(project_data, default=str)
 
-    return {
-        "project_id": project_id,
-        "project_name": req.project_name,
-        "status": "pending_selection",
-        "candidates": result.get("candidates", []),
-    }
+            conn = sqlite3.connect(str(DB_FILE))
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (?, ?, ?, ?, ?)",
+                (project_id, resolved_user_id, req.project_name, created_at, project_data_json),
+            )
+
+            for agent, round_data in result.get("debates", {}).items():
+                if round_data and "root" in round_data:
+                    for reply in round_data["root"]:
+                        msg_id = str(uuid.uuid4())
+                        stance_val = reply.get("stance", "neutral")
+                        if isinstance(stance_val, dict) and "value" in stance_val:
+                            stance_val = stance_val["value"]
+                        elif hasattr(stance_val, "value"):
+                            stance_val = stance_val.value
+                        message_text = f"Debated {reply.get('reply_to', '')} ({stance_val}): {reply.get('argument', '')}"
+                        c.execute(
+                            "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (msg_id, project_id, agent, message_text, created_at),
+                        )
+            conn.commit()
+            conn.close()
+
+            final_res = {
+                "type": "result",
+                "project_id": project_id,
+                "project_name": req.project_name,
+                "status": "pending_selection",
+                "candidates": result.get("candidates", []),
+            }
+            yield f"data: {json.dumps(final_res)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
+
+    return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
 
 class SelectCandidateRequest(BaseModel):
@@ -494,50 +619,140 @@ async def handle_refine(req: RefReqWithProject, request: Request, authorization:
         context_parts.append(f"Time available: {req.time_hours} hours")
     idea_context = "\n".join(context_parts) if context_parts else None
 
-    # Run the core refinement pipeline
-    result = await run_pipeline(request.app, req.idea, idea_context=idea_context)
+    async def sse_generator():
+        queue = asyncio.Queue()
+        async def run_pipeline_task():
+            with redirect_stdout_to_queue(queue):
+                result = await run_pipeline(request.app, req.idea, idea_context=idea_context)
+            return result
 
-    # Save to SQLite Projects
-    project_id = str(uuid.uuid4())
-    created_at = datetime.datetime.utcnow().isoformat()
-    
-    # PipelineResult is a Python dataclass; we serialize it to dict
-    res_dict = {
-        "idea": req.idea,
-        "reviews": {k: v.model_dump() for k, v in result.reviews.items()},
-        "debate": {k: v.model_dump() for k, v in result.debate.items()},
-        "reflections": {k: v.model_dump() for k, v in result.reflections.items()},
-        "moderator": result.moderator.model_dump() if result.moderator else None,
-        "research": {k: v.model_dump() for k, v in result.research.items()},
-    }
-    project_data_json = json.dumps(res_dict, default=str)
+        task = asyncio.create_task(run_pipeline_task())
+        while not task.done() or not queue.empty():
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=0.1)
+                if isinstance(item, Exception):
+                    yield f"data: {json.dumps({'type': 'log', 'text': f'[ERROR] {str(item)}', 'agent': 'SYSTEM'})}\n\n"
+                    break
+                agent = "SYSTEM"
+                text = item
+                for possible_agent in ["Innovation", "Feasibility", "Impact", "Technical", "Skeptic", "Moderator", "Ideator", "Researcher", "Strategist"]:
+                    if possible_agent.lower() in item.lower():
+                        agent = f"{possible_agent} Agent"
+                        break
+                yield f"data: {json.dumps({'type': 'log', 'text': text, 'agent': agent})}\n\n"
+                queue.task_done()
+            except asyncio.TimeoutError:
+                continue
 
-    conn = sqlite3.connect(str(DB_FILE))
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (?, ?, ?, ?, ?)",
-        (project_id, resolved_user_id, req.project_name, created_at, project_data_json),
-    )
+        try:
+            result = await task
+            created_at = datetime.datetime.utcnow().isoformat()
+            
+            res_dict = {
+                "idea": req.idea,
+                "reviews": {k: v.model_dump() for k, v in result.reviews.items()},
+                "debate": {k: v.model_dump() for k, v in result.debate.items()},
+                "reflections": {k: v.model_dump() for k, v in result.reflections.items()},
+                "moderator": result.moderator.model_dump() if result.moderator else None,
+                "research": {k: v.model_dump() for k, v in result.research.items()},
+            }
 
-    # Extract debates and save to chats table
-    for agent, round_data in result.debate.items():
-        if round_data and round_data.root:
-            for reply in round_data.root:
-                msg_id = str(uuid.uuid4())
-                message_text = f"Debated {reply.reply_to} ({reply.stance.value}): {reply.argument}"
+            project_id = req.project_id or str(uuid.uuid4())
+            project_data = {}
+
+            conn = sqlite3.connect(str(DB_FILE))
+            c = conn.cursor()
+
+            # When iterating an existing idea (project_id provided), append a new
+            # version to the SAME project instead of creating a brand-new one.
+            if req.project_id:
                 c.execute(
-                    "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (msg_id, project_id, agent, message_text, created_at),
+                    "SELECT project_data, name FROM projects WHERE id = ? AND user_id = ?",
+                    (req.project_id, resolved_user_id),
+                )
+                row = c.fetchone()
+                if not row:
+                    conn.close()
+                    raise HTTPException(status_code=404, detail="Project not found or access denied")
+                project_data = json.loads(row[0]) if row[0] else {}
+                if not req.project_name:
+                    req.project_name = row[1]
+
+            versions = project_data.get("versions")
+            if not isinstance(versions, list):
+                # Seed any legacy refinement as version 1 so iterations stack cleanly.
+                versions = []
+                legacy = project_data.get("refinement")
+                if isinstance(legacy, dict):
+                    versions.append({
+                        "version": 1,
+                        "created_at": project_data.get("created_at", created_at),
+                        "idea": legacy.get("idea", ""),
+                        "reviews": legacy.get("reviews", {}),
+                        "debate": legacy.get("debate", {}),
+                        "reflections": legacy.get("reflections", {}),
+                        "moderator": legacy.get("moderator", None),
+                        "research": legacy.get("research", {}),
+                    })
+
+            next_version = (versions[-1]["version"] + 1) if versions else 1
+
+            version_obj = {
+                "version": next_version,
+                "created_at": created_at,
+                "idea": req.idea,
+                "reviews": res_dict["reviews"],
+                "debate": res_dict["debate"],
+                "reflections": res_dict["reflections"],
+                "moderator": res_dict["moderator"],
+                "research": res_dict["research"],
+            }
+            versions.append(version_obj)
+
+            # Keep latest version mirrored under `refinement` for backward compat.
+            project_data["versions"] = versions
+            project_data["refinement"] = res_dict
+            project_data["created_at"] = created_at
+
+            project_data_json = json.dumps(project_data, default=str)
+
+            if req.project_id:
+                c.execute(
+                    "UPDATE projects SET project_data = ?, name = ? WHERE id = ?",
+                    (project_data_json, req.project_name, project_id),
+                )
+            else:
+                c.execute(
+                    "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (?, ?, ?, ?, ?)",
+                    (project_id, resolved_user_id, req.project_name, created_at, project_data_json),
                 )
 
-    conn.commit()
-    conn.close()
+            for agent, round_data in result.debate.items():
+                if round_data and round_data.root:
+                    for reply in round_data.root:
+                        msg_id = str(uuid.uuid4())
+                        message_text = f"Debated {reply.reply_to} ({reply.stance.value}): {reply.argument}"
+                        c.execute(
+                            "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (msg_id, project_id, agent, message_text, created_at),
+                        )
 
-    return {
-        "project_id": project_id,
-        "project_name": req.project_name,
-        "result": res_dict,
-    }
+            conn.commit()
+            conn.close()
+
+            final_res = {
+                "type": "result",
+                "project_id": project_id,
+                "project_name": req.project_name,
+                "version": next_version,
+                "versions": [v["version"] for v in versions],
+                "result": res_dict,
+            }
+            yield f"data: {json.dumps(final_res)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
+
+    return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
 
 from llm import LLM
@@ -693,23 +908,78 @@ async def chat_with_agent(project_id: str, req: ChatAgentRequest, authorization:
     }
 
 
-@app.get("/api/projects/collaborations")
-async def get_collaborated_projects(authorization: str = Header(None)):
-    resolved_user_id = get_user_id_from_header(authorization)
-    conn = sqlite3.connect(str(DB_FILE))
-    c = conn.cursor()
-    c.execute("""
-        SELECT p.id, p.name, p.created_at 
-        FROM projects p
-        JOIN project_collaborators pc ON p.id = pc.project_id
-        WHERE pc.user_id = ?
-        ORDER BY p.created_at DESC
-    """, (resolved_user_id,))
-    rows = c.fetchall()
-    conn.close()
-    return [
-        {"id": row[0], "name": row[1], "created_at": row[2]} for row in rows
-    ]
+
+
+
+def send_invitation_email(
+    invitee_email: str,
+    invitee_username: str,
+    sender_username: str,
+    sender_email: str,
+    project_name: str,
+    invite_id: str
+):
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    try:
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    except ValueError:
+        smtp_port = 587
+        
+    smtp_username = os.environ.get("SMTP_USERNAME")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+    smtp_from = os.environ.get("SMTP_FROM", "no-reply@crucible.ai")
+    frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+    
+    accept_link = f"{frontend_url}?accept_invite={invite_id}"
+    
+    subject = f"Crucible: Invitation to collaborate on project '{project_name}'"
+    body = f"""Hello {invitee_username},
+
+You have been invited by {sender_username} ({sender_email}) to collaborate on the project '{project_name}' in Crucible.
+
+To accept this invitation and join the collaboration, please click the link below:
+{accept_link}
+
+If you do not have an account, please register using this email address: {invitee_email} and then click the link.
+
+Best regards,
+Crucible Team
+"""
+    # Log to sent_emails.log
+    log_dir = ROOT_DIR / "outputs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "sent_emails.log"
+    try:
+        with open(log_file, "a") as f:
+            f.write(f"--- EMAIL SENT AT {datetime.datetime.utcnow().isoformat()} ---\n")
+            f.write(f"To: {invitee_email}\n")
+            f.write(f"Subject: {subject}\n")
+            f.write(f"Body:\n{body}\n")
+            f.write("-" * 40 + "\n")
+    except Exception as log_err:
+        print(f"Failed to log email: {log_err}")
+
+    if not smtp_username or not smtp_password:
+        print(f"[MOCK EMAIL] SMTP credentials not set. Logged link to: {log_file}")
+        print(f"[MOCK EMAIL] Link: {accept_link}")
+        return
+
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = f"{sender_username} via Crucible <{smtp_from}>"
+        msg['Reply-To'] = sender_email
+        msg['To'] = invitee_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        
+        server = smtplib.SMTP(smtp_host, smtp_port)
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        server.sendmail(smtp_from, invitee_email, msg.as_string())
+        server.quit()
+        print(f"Successfully sent invitation email to {invitee_email}")
+    except Exception as e:
+        print(f"Error sending email: {str(e)}")
 
 
 class InviteUserRequest(BaseModel):
@@ -717,7 +987,12 @@ class InviteUserRequest(BaseModel):
 
 
 @app.post("/api/projects/{project_id}/invite")
-async def invite_collaborator(project_id: str, req: InviteUserRequest, authorization: str = Header(None)):
+async def invite_collaborator(
+    project_id: str, 
+    req: InviteUserRequest, 
+    background_tasks: BackgroundTasks,
+    authorization: str = Header(None)
+):
     resolved_user_id = get_user_id_from_header(authorization)
     
     conn = sqlite3.connect(str(DB_FILE))
@@ -725,7 +1000,7 @@ async def invite_collaborator(project_id: str, req: InviteUserRequest, authoriza
     
     # 1. Verify that the logged-in user is either the owner or a collaborator
     c.execute("""
-        SELECT p.id 
+        SELECT p.id, p.name 
         FROM projects p
         LEFT JOIN project_collaborators pc ON p.id = pc.project_id
         WHERE p.id = ? AND (p.user_id = ? OR pc.user_id = ?)
@@ -735,6 +1010,14 @@ async def invite_collaborator(project_id: str, req: InviteUserRequest, authoriza
         conn.close()
         raise HTTPException(status_code=403, detail="Access denied or project not found")
         
+    project_name = project_row[1]
+
+    # Get sender username and email
+    c.execute("SELECT username, email FROM users WHERE id = ?", (resolved_user_id,))
+    sender_row = c.fetchone()
+    sender_username = sender_row[0] if sender_row else "An Operator"
+    sender_email = sender_row[1] if sender_row else ""
+
     # 2. Find target user by email
     c.execute("SELECT id, username FROM users WHERE email = ?", (req.email,))
     invitee_row = c.fetchone()
@@ -743,6 +1026,7 @@ async def invite_collaborator(project_id: str, req: InviteUserRequest, authoriza
         raise HTTPException(status_code=404, detail="Operator with this email not registered yet")
         
     invitee_id = invitee_row[0]
+    invitee_username = invitee_row[1]
     
     # 3. Prevent self-invitation
     if invitee_id == resolved_user_id:
@@ -755,11 +1039,30 @@ async def invite_collaborator(project_id: str, req: InviteUserRequest, authoriza
         conn.close()
         raise HTTPException(status_code=400, detail="This operator is already a collaborator on this project")
         
-    # 5. Check if invitation already pending
+    # 5. Check if invitation already pending (allow resending)
     c.execute("SELECT id FROM invitations WHERE project_id = ? AND invitee_email = ? AND status = 'pending'", (project_id, req.email))
-    if c.fetchone():
+    existing_invite = c.fetchone()
+    if existing_invite:
+        invite_id = existing_invite[0]
+        created_at = datetime.datetime.utcnow().isoformat()
+        c.execute("UPDATE invitations SET created_at = ? WHERE id = ?", (created_at, invite_id))
+        conn.commit()
         conn.close()
-        raise HTTPException(status_code=400, detail="An invitation is already pending for this operator")
+        
+        frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+        invite_link = f"{frontend_url}?accept_invite={invite_id}"
+        
+        # Resend email in background
+        background_tasks.add_task(
+            send_invitation_email,
+            req.email,
+            invitee_username,
+            sender_username,
+            sender_email,
+            project_name,
+            invite_id
+        )
+        return {"message": f"Invitation resent to {req.email}. Link: {invite_link}"}
         
     # 6. Create invitation
     invite_id = str(uuid.uuid4())
@@ -771,7 +1074,22 @@ async def invite_collaborator(project_id: str, req: InviteUserRequest, authoriza
     
     conn.commit()
     conn.close()
-    return {"message": f"Invitation successfully transmitted to {req.email}"}
+    
+    frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+    invite_link = f"{frontend_url}?accept_invite={invite_id}"
+    
+    # Schedule background email send
+    background_tasks.add_task(
+        send_invitation_email,
+        req.email,
+        invitee_username,
+        sender_username,
+        sender_email,
+        project_name,
+        invite_id
+    )
+    
+    return {"message": f"Invitation successfully transmitted to {req.email}. Link: {invite_link}"}
 
 
 @app.get("/api/invitations")

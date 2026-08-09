@@ -2,6 +2,19 @@ import React, { useState, useEffect, useRef } from "react";
 
 const API_BASE = "http://localhost:8000";
 
+const getAgentColor = (agentName) => {
+  if (!agentName) return "#64748b";
+  const name = agentName.toLowerCase();
+  if (name.includes("innovation")) return "#eab308";
+  if (name.includes("feasibility")) return "#a855f7";
+  if (name.includes("impact")) return "#3b82f6";
+  if (name.includes("technical")) return "#10b981";
+  if (name.includes("skeptic")) return "#f43f5e";
+  if (name.includes("moderator")) return "#06b6d4";
+  return "#64748b";
+};
+
+
 export default function App() {
   // Auth state
   const [token, setToken] = useState(localStorage.getItem("crucible_token") || null);
@@ -72,8 +85,10 @@ export default function App() {
   const [showCollabModal, setShowCollabModal] = useState(false);
   const [candidateSelectionLoading, setCandidateSelectionLoading] = useState(false);
   const [activeTabSubView, setActiveTabSubView] = useState("overview"); // overview | reviews | debates | chat | candidates
+  const [activeDebateStage, setActiveDebateStage] = useState("reviews");
   const [selectedCandidateIdx, setSelectedCandidateIdx] = useState(0);
   const [selectedImprovements, setSelectedImprovements] = useState({});
+  const [activeVersionIdx, setActiveVersionIdx] = useState(0);
 
   const toggleImprovement = (idx) => {
     setSelectedImprovements(prev => ({
@@ -114,13 +129,66 @@ export default function App() {
     }
   }, [consoleLogs]);
 
+  // Sync active debate stage when active project changes
+  useEffect(() => {
+    if (activeProject) {
+      const data = activeProject.project_data;
+      if (data) {
+        const hasRefinement = data.refinement !== undefined;
+        if (hasRefinement) {
+          setActiveDebateStage("reviews");
+        } else {
+          setActiveDebateStage("proposals");
+        }
+      }
+    }
+  }, [activeProject]);
+
+  const buildIdeasFromData = (pd) => {
+    if (!pd || typeof pd !== "object") return [];
+    const ideas = [];
+    if (Array.isArray(pd.candidates)) {
+      pd.candidates.forEach((cand, idx) => {
+        const title = cand?.title || "";
+        ideas.push({ type: "candidate", idx, label: `Idea #${idx + 1}: ${title}`, title });
+      });
+    }
+    if (Array.isArray(pd.versions)) {
+      pd.versions.forEach((v, vIdx) => {
+        const title = v?.moderator?.refined_idea || "";
+        ideas.push({ type: "version", idx: vIdx, label: `Version ${v.version ?? vIdx + 1}`, title });
+      });
+    }
+    if (ideas.length === 0 && pd.refinement && typeof pd.refinement === "object") {
+      const title = pd.refinement.moderator?.refined_idea || "";
+      ideas.push({ type: "version", idx: 0, label: "Version 1", title });
+    }
+    return ideas;
+  };
+
   const loadProjects = async () => {
     try {
       const res = await fetch(`${API_BASE}/api/projects`, {
         headers: { "Authorization": `Bearer ${token}` }
       });
       if (res.ok) {
-        const data = await res.json();
+        let data = await res.json();
+        data = await Promise.all(data.map(async (p) => {
+          if (p.ideas && p.ideas.length) return p;
+          try {
+            const d = await fetch(`${API_BASE}/api/projects/${p.id}`, {
+              headers: { "Authorization": `Bearer ${token}` }
+            });
+            if (d.ok) {
+              const detail = await d.json();
+              const ideas = buildIdeasFromData(detail.project_data);
+              if (ideas.length) return { ...p, ideas };
+            }
+          } catch (err) {
+            console.error("Error enriching project ideas", p.id, err);
+          }
+          return p;
+        }));
         setProjects(data);
       } else if (res.status === 401) {
         handleLogout();
@@ -181,6 +249,17 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const inviteId = params.get("accept_invite") || params.get("invite");
+    if (inviteId && token) {
+      respondToInvitation(inviteId, "accept").then(() => {
+        const newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
+        window.history.replaceState({ path: newUrl }, "", newUrl);
+      });
+    }
+  }, [token]);
+
   const loadCollaborators = async (projectId) => {
     try {
       const res = await fetch(`${API_BASE}/api/projects/${projectId}/collaborators`, {
@@ -210,7 +289,7 @@ export default function App() {
       });
       const data = await res.json();
       if (res.ok) {
-        setInviteStatus(`[SUCCESS] Invite sent to ${inviteEmail}`);
+        setInviteStatus(`[SUCCESS] ${data.message || `Invite sent to ${inviteEmail}`}`);
         setInviteEmail("");
         loadCollaborators(activeProject.id);
       } else {
@@ -300,6 +379,13 @@ export default function App() {
   };
 
   const handleRefineCurrentIdea = () => {
+    // If the idea is already refined, re-iterating should stack a new VERSION of the
+    // same idea (no new project) rather than silently overwrite the current analysis.
+    const alreadyRefined = !!(loadedResult?.refinement) || !!(loadedResult?.versions?.length) || !!loadedResult?.moderator;
+    if (alreadyRefined) {
+      if (typeof triggerIteration === "function") triggerIteration();
+      return;
+    }
     const cand = getActiveCandidateInfo();
     if (cand) {
       selectCandidateIdea(cand);
@@ -417,6 +503,9 @@ export default function App() {
         }
         setActiveProject(data);
         setLoadedResult(parsedData);
+        setActiveVersionIdx(Array.isArray(parsedData.versions) && parsedData.versions.length
+          ? parsedData.versions.length - 1
+          : 0);
         loadCollaborators(projectId);
         
         // Load chats
@@ -618,6 +707,41 @@ export default function App() {
     clearInterval(progressTimerRef.current);
   };
 
+  const readStreamResponse = async (response, onLog, onResult, onError) => {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop(); // keep partial line in buffer
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith("data: ")) {
+            try {
+              const data = JSON.parse(trimmed.slice(6));
+              if (data.type === "log") {
+                onLog(data);
+              } else if (data.type === "result") {
+                onResult(data);
+              } else if (data.type === "error") {
+                onError(data.detail || "Server error in stream");
+              }
+            } catch (err) {
+              console.error("Failed to parse stream line:", trimmed, err);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error("Stream reader error:", err);
+      onError(err.message);
+    }
+  };
+
   const submitRefine = async (e) => {
     e.preventDefault();
     if (!projectName.trim()) {
@@ -627,6 +751,11 @@ export default function App() {
 
     setActiveTab("running");
     startProgressTimer();
+    setConsoleLogs([{
+      agent: "SYSTEM",
+      text: "Establishing secure connection to neural pathway...",
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    }]);
 
     const payload = {
       project_name: projectName,
@@ -636,41 +765,56 @@ export default function App() {
       time_hours: refineTime ? parseInt(refineTime) : null
     };
 
-    let apiError = null;
-    let resultData = null;
+    try {
+      const res = await fetch(`${API_BASE}/idea/refine`, {
+        method: "POST",
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}` 
+        },
+        body: JSON.stringify(payload)
+      });
 
-    const apiCall = fetch(`${API_BASE}/idea/refine`, {
-      method: "POST",
-      headers: { 
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}` 
-      },
-      body: JSON.stringify(payload)
-    }).then(async res => {
-      if (res.ok) {
-        resultData = await res.json();
-      } else {
+      if (!res.ok) {
         const text = await res.text();
-        apiError = `Server error ${res.status}: ${text}`;
+        throw new Error(`Server error ${res.status}: ${text}`);
       }
-    }).catch(err => {
-      apiError = err.message;
-    });
 
-    runMockLogs(async () => {
-      await apiCall;
+      let resultData = null;
+      await readStreamResponse(
+        res,
+        (log) => {
+          setConsoleLogs(prev => [...prev, {
+            agent: log.agent || "SYSTEM",
+            text: log.text,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+          }]);
+        },
+        (result) => {
+          resultData = result;
+        },
+        (errorMsg) => {
+          throw new Error(errorMsg);
+        }
+      );
+
       stopProgressTimer();
-
-      if (apiError) {
-        appendConsoleLine(`[ERROR] Refinement pipeline execution failed: ${apiError}`, "#ffb4ab");
-        alert("Execution failed: " + apiError);
-        setActiveTab("refine_form");
-      } else {
-        // Load details of the newly created project
-        loadProjects();
-        loadProjectDetails(resultData.project_id);
+      if (!resultData) {
+        throw new Error("No result metadata returned from stream.");
       }
-    });
+
+      loadProjects();
+      loadProjectDetails(resultData.project_id);
+    } catch (err) {
+      stopProgressTimer();
+      setConsoleLogs(prev => [...prev, {
+        agent: "SYSTEM",
+        text: `[ERROR] Refinement pipeline execution failed: ${err.message}`,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      }]);
+      alert("Execution failed: " + err.message);
+      setActiveTab("refine_form");
+    }
   };
 
   const submitGenerate = async (e) => {
@@ -682,6 +826,11 @@ export default function App() {
 
     setActiveTab("running");
     startProgressTimer();
+    setConsoleLogs([{
+      agent: "SYSTEM",
+      text: "Establishing secure connection to neural pathway...",
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    }]);
 
     const urls = genUrls ? genUrls.split(/\s+/).filter(u => u.trim()) : null;
     const payload = {
@@ -695,40 +844,56 @@ export default function App() {
       urls
     };
 
-    let apiError = null;
-    let resultData = null;
+    try {
+      const res = await fetch(`${API_BASE}/idea/generate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify(payload)
+      });
 
-    const apiCall = fetch(`${API_BASE}/idea/generate`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`
-      },
-      body: JSON.stringify(payload)
-    }).then(async res => {
-      if (res.ok) {
-        resultData = await res.json();
-      } else {
+      if (!res.ok) {
         const text = await res.text();
-        apiError = `Server error ${res.status}: ${text}`;
+        throw new Error(`Server error ${res.status}: ${text}`);
       }
-    }).catch(err => {
-      apiError = err.message;
-    });
 
-    runMockLogs(async () => {
-      await apiCall;
+      let resultData = null;
+      await readStreamResponse(
+        res,
+        (log) => {
+          setConsoleLogs(prev => [...prev, {
+            agent: log.agent || "SYSTEM",
+            text: log.text,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+          }]);
+        },
+        (result) => {
+          resultData = result;
+        },
+        (errorMsg) => {
+          throw new Error(errorMsg);
+        }
+      );
+
       stopProgressTimer();
-
-      if (apiError) {
-        appendConsoleLine(`[ERROR] Generation pipeline execution failed: ${apiError}`, "#ffb4ab");
-        alert("Execution failed: " + apiError);
-        setActiveTab("generate_form");
-      } else {
-        loadProjects();
-        loadProjectDetails(resultData.project_id);
+      if (!resultData) {
+        throw new Error("No result metadata returned from stream.");
       }
-    });
+
+      loadProjects();
+      loadProjectDetails(resultData.project_id);
+    } catch (err) {
+      stopProgressTimer();
+      setConsoleLogs(prev => [...prev, {
+        agent: "SYSTEM",
+        text: `[ERROR] Generation pipeline execution failed: ${err.message}`,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      }]);
+      alert("Execution failed: " + err.message);
+      setActiveTab("generate_form");
+    }
   };
 
   const triggerIteration = async () => {
@@ -742,52 +907,84 @@ export default function App() {
       else rejected.push(chk.value);
     });
 
-    const baseIdea = loadedResult?.moderator ? loadedResult.moderator.refined_idea : "";
-    
+    const _versionList = Array.isArray(loadedResult.versions) ? loadedResult.versions : null;
+    const _curVersion = _versionList && _versionList.length
+      ? _versionList[Math.min(activeVersionIdx, _versionList.length - 1)]
+      : null;
+    const baseIdea = _curVersion?.moderator?.refined_idea
+      || loadedResult?.refinement?.moderator?.refined_idea
+      || loadedResult?.moderator?.refined_idea
+      || "";
+
     setActiveTab("running");
     startProgressTimer();
+    setConsoleLogs([{
+      agent: "SYSTEM",
+      text: "Establishing secure connection to neural pathway...",
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    }]);
 
     const payload = {
       project_name: activeProject.name,
       idea: `BASELINE IDEA:\n${baseIdea}\n\nAccepted Improvements:\n${accepted.map(a => `- ${a}`).join('\n')}\n\nRejected Improvements:\n${rejected.map(r => `- ${r}`).join('\n')}\n\nOperator Notes:\n${operatorNotes}`,
       theme: null,
       team_size: null,
-      time_hours: null
+      time_hours: null,
+      project_id: activeProject.id
     };
 
-    let apiError = null;
-    let resultData = null;
+    try {
+      const res = await fetch(`${API_BASE}/idea/refine`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify(payload)
+      });
 
-    const apiCall = fetch(`${API_BASE}/idea/refine`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`
-      },
-      body: JSON.stringify(payload)
-    }).then(async res => {
-      if (res.ok) {
-        resultData = await res.json();
-      } else {
-        apiError = `Server returned status ${res.status}`;
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Server error ${res.status}: ${text}`);
       }
-    }).catch(err => {
-      apiError = err.message;
-    });
 
-    runMockLogs(async () => {
-      await apiCall;
+      let resultData = null;
+      await readStreamResponse(
+        res,
+        (log) => {
+          setConsoleLogs(prev => [...prev, {
+            agent: log.agent || "SYSTEM",
+            text: log.text,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+          }]);
+        },
+        (result) => {
+          resultData = result;
+        },
+        (errorMsg) => {
+          throw new Error(errorMsg);
+        }
+      );
+
       stopProgressTimer();
-
-      if (apiError) {
-        appendConsoleLine(`[ERROR] Iteration failed: ${apiError}`, "#ffb4ab");
-        alert("Iteration failed: " + apiError);
-        setActiveTab("dashboard");
-      } else {
-        loadProjects();
-        loadProjectDetails(resultData.project_id);
+      if (!resultData) {
+        throw new Error("No result metadata returned from stream.");
       }
-    });
+
+      // Reload the SAME project; point at the newest version (iterations stack, no new project).
+      setActiveVersionIdx((resultData.version != null ? resultData.version : 1) - 1);
+      loadProjects();
+      loadProjectDetails(activeProject.id);
+    } catch (err) {
+      stopProgressTimer();
+      setConsoleLogs(prev => [...prev, {
+        agent: "SYSTEM",
+        text: `[ERROR] Iteration failed: ${err.message}`,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      }]);
+      alert("Iteration failed: " + err.message);
+      setActiveTab("dashboard");
+    }
   };
 
   const openAgentModal = (name) => {
@@ -972,12 +1169,25 @@ export default function App() {
     activeCand.title?.toLowerCase().includes(loadedResult.selected_candidate.title?.toLowerCase())
   );
 
+  const versionList = Array.isArray(loadedResult?.versions) ? loadedResult.versions : null;
+  const activeVersion = versionList && versionList.length > 0
+    ? versionList[Math.min(activeVersionIdx, versionList.length - 1)]
+    : null;
+
   const innerResult = loadedResult 
-    ? (loadedResult.selected_candidate 
-        ? (isCurrentCandidateRefined ? (loadedResult.refinement || {}) : {})
-        : (loadedResult.result || loadedResult.refinement || loadedResult)) 
+    ? (activeVersion
+        ? activeVersion
+        : (loadedResult.selected_candidate 
+            ? (isCurrentCandidateRefined ? (loadedResult.refinement || {}) : {})
+            : (loadedResult.result || loadedResult.refinement || loadedResult))) 
     : {};
   const isGenerationKind = loadedResult && (loadedResult.kind === "generate" || !!innerResult?.conclusion);
+
+  // Normalize refinement data across storage shapes so the debate workspace always renders
+  // Structured analysis may live under innerResult.refinement or directly under innerResult.
+  const innerRefinement = innerResult?.refinement
+    || (innerResult && (innerResult.reviews || innerResult.reflections || innerResult.moderator) ? innerResult : null);
+  const innerStageData = innerRefinement || innerResult;
 
   const isBrainstormTab = ["pathway", "refine_form", "generate_form", "running", "dashboard", "analytics", "config", "logs", "status"].includes(activeTab);
 
@@ -1023,7 +1233,6 @@ export default function App() {
               {theme === "dark" ? "light_mode" : "dark_mode"}
             </span>
           </button>
-            <img src="/favicon.png" className="w-4 h-4 rounded-full" alt="Crucible Logo" />
 
           {/* Welcome Clearance */}
           <div className="hidden lg:block font-code-sm text-xs text-slate-500 dark:text-on-surface-variant select-none">
@@ -1098,28 +1307,77 @@ export default function App() {
                             </button>
                           </a>
 
-                          {/* Subfolders for candidate project ideas */}
-                          {activeProject?.id === proj.id && loadedResult?.candidates && Array.isArray(loadedResult.candidates) && loadedResult.candidates.length > 0 && (
-                            <div className="ml-md space-y-base border-l-2 border-slate-200 dark:border-white/10 pl-xs my-xs">
-                              {loadedResult.candidates.map((cand, cIdx) => (
-                                <div
-                                  key={cIdx}
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    loadProjectDetails(proj.id, cIdx);
-                                  }}
-                                  className={`flex items-center gap-xs px-xs py-base rounded text-[11px] font-code-sm cursor-pointer truncate transition-all ${
-                                    selectedCandidateIdx === cIdx
-                                      ? "text-cyan-700 dark:text-cyan-300 font-bold bg-cyan-500/10 border-l-2 border-cyan-500"
-                                      : "text-slate-500 dark:text-on-surface-variant hover:text-slate-900 dark:hover:text-white"
-                                  }`}
-                                >
-                                  <span className="material-symbols-outlined text-[12px]">lightbulb</span>
-                                  <span className="truncate">Idea #{cIdx + 1}: {cand.title}</span>
-                                </div>
-                              ))}
-                            </div>
-                          )}
+                          {/* Browsable idea list under each project folder */}
+                          {(() => {
+                            // Build the idea list from loaded data for the active project
+                            // (works without a backend restart), else from the projects payload.
+                            let projIdeas = [];
+                            if (activeProject?.id === proj.id && loadedResult) {
+                              if (Array.isArray(loadedResult.candidates)) {
+                                loadedResult.candidates.forEach((cand, idx) => {
+                                  const title = cand?.title || "";
+                                  projIdeas.push({ type: "candidate", idx, label: `Idea #${idx + 1}: ${title}`, title });
+                                });
+                              }
+                              if (versionList && versionList.length > 0) {
+                                versionList.forEach((v, vIdx) => {
+                                  const title = v?.moderator?.refined_idea || "";
+                                  projIdeas.push({ type: "version", idx: vIdx, label: `Version ${v.version ?? vIdx + 1}`, title });
+                                });
+                              }
+                            } else if (proj.ideas && proj.ideas.length > 0) {
+                              projIdeas = proj.ideas;
+                            }
+                            if (projIdeas.length === 0) return null;
+                            return (
+                              <div className="ml-md space-y-base border-l-2 border-slate-200 dark:border-white/10 pl-xs my-xs">
+                                {projIdeas.map((idea, iIdx) => {
+                                  const isCandidate = idea.type === "candidate";
+                                  const isActive = activeProject?.id === proj.id && (
+                                    isCandidate
+                                      ? selectedCandidateIdx === idea.idx
+                                      : idea.idx === Math.min(activeVersionIdx, Math.max(0, (versionList?.length || 1) - 1))
+                                  );
+                                  return (
+                                    <div
+                                      key={`${idea.type}-${idea.idx}`}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        if (proj.id === activeProject?.id) {
+                                          if (isCandidate) {
+                                            setActiveVersionIdx(0);
+                                            setActiveDebateStage("proposals");
+                                            loadProjectDetails(proj.id, idea.idx);
+                                          } else {
+                                            setActiveVersionIdx(idea.idx);
+                                            setActiveDebateStage("reviews");
+                                          }
+                                        } else if (isCandidate) {
+                                          setActiveVersionIdx(0);
+                                          loadProjectDetails(proj.id, idea.idx);
+                                        } else {
+                                          loadProjectDetails(proj.id);
+                                          setActiveVersionIdx(idea.idx);
+                                          setActiveDebateStage("reviews");
+                                        }
+                                      }}
+                                      title={idea.title}
+                                      className={`flex items-center gap-xs px-xs py-base rounded text-[11px] font-code-sm cursor-pointer truncate transition-all ${
+                                        isActive
+                                          ? "text-cyan-700 dark:text-cyan-300 font-bold bg-cyan-500/10 border-l-2 border-cyan-500"
+                                          : "text-slate-500 dark:text-on-surface-variant hover:text-slate-900 dark:hover:text-white"
+                                      }`}
+                                    >
+                                      <span className="material-symbols-outlined text-[12px] flex-shrink-0">
+                                        {isCandidate ? "lightbulb" : "history"}
+                                      </span>
+                                      <span className="truncate">{idea.label}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            );
+                          })()}
                         </div>
                       ))
                     )}
@@ -1471,35 +1729,76 @@ export default function App() {
                         </div>
                       </div>
                       
-                      {/* Live Agent Conversation Feed */}
-                      <div className="bg-slate-900 dark:bg-[#0d0e12] border border-slate-800 dark:border-white/10 p-md font-code-sm text-xs rounded-xl h-96 overflow-y-auto space-y-md text-left">
-                        {consoleLogs.map((log, idx) => {
-                          const isSystem = !log.agent || log.agent === "SYSTEM";
-                          return (
-                            <div key={idx} className={`flex items-start gap-sm animate-fadeIn ${isSystem ? "opacity-75 justify-center py-xs" : ""}`}>
-                              {isSystem ? (
-                                <div className="bg-slate-800/80 text-slate-300 px-md py-xs rounded-full text-[11px] border border-white/5 flex items-center gap-xs">
-                                  <span className="material-symbols-outlined text-xs text-cyan-400">memory</span>
-                                  {log.text}
-                                </div>
-                              ) : (
-                                <div className="flex items-start gap-sm w-full">
-                                  <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs flex-shrink-0 ${log.color || "bg-cyan-500/20 text-cyan-300 border border-cyan-500/30"}`}>
-                                    <span className="material-symbols-outlined text-sm">{log.avatar || "smart_toy"}</span>
-                                  </div>
-                                  <div className="flex-1 bg-slate-850 dark:bg-[#161820] border border-slate-800 dark:border-white/10 p-sm rounded-xl space-y-xs">
-                                    <div className="flex items-center justify-between border-b border-white/5 pb-1">
-                                      <span className="font-bold text-slate-200 dark:text-white text-xs">{log.agent}</span>
-                                      <span className="text-[9px] text-slate-400 uppercase tracking-widest">{log.timestamp || "Live Debate"}</span>
-                                    </div>
-                                    <p className="text-slate-300 dark:text-slate-200 leading-relaxed text-xs">{log.text}</p>
-                                  </div>
-                                </div>
-                              )}
+                      {/* WhatsApp Style Group Chat Frame */}
+                      <div className="flex flex-col border border-slate-300 dark:border-[#2f3b43] rounded-xl overflow-hidden shadow-lg h-[450px]">
+                        {/* WhatsApp Header */}
+                        <div className="bg-[#075e54] dark:bg-[#202c33] text-white px-md py-sm flex items-center gap-sm select-none">
+                          <div className="w-10 h-10 rounded-full bg-white/10 dark:bg-white/5 border border-white/20 flex items-center justify-center flex-shrink-0">
+                            <span className="material-symbols-outlined text-lg text-white">groups</span>
+                          </div>
+                          <div className="flex-1 min-w-0 text-left">
+                            <div className="font-bold text-sm leading-tight">Crucible Expert Debate Panel</div>
+                            <div className="text-[10px] text-white/80 dark:text-[#8696a0] truncate">
+                              Skeptic, Innovation, Feasibility, Impact, Technical, Moderator
                             </div>
-                          );
-                        })}
-                        <div ref={consoleEndRef} />
+                          </div>
+                          <div className="flex items-center gap-xs text-white/85">
+                            <span className="material-symbols-outlined text-base">videocam</span>
+                            <span className="material-symbols-outlined text-base">call</span>
+                            <span className="material-symbols-outlined text-base">more_vert</span>
+                          </div>
+                        </div>
+
+                        {/* WhatsApp Messages Area */}
+                        <div 
+                          className="flex-1 overflow-y-auto p-md space-y-sm text-left relative"
+                          style={{
+                            backgroundColor: theme === "dark" ? "#0b141a" : "#efeae2",
+                            backgroundImage: "radial-gradient(#128c7e05 1px, transparent 1px)",
+                            backgroundSize: "20px 20px"
+                          }}
+                        >
+                          {consoleLogs.map((log, idx) => {
+                            const isSystem = !log.agent || log.agent === "SYSTEM";
+                            if (isSystem) {
+                              return (
+                                <div key={idx} className="flex justify-center my-xs">
+                                  <div className="bg-[#ffeecd]/80 dark:bg-[#182229]/80 text-[#54656f] dark:text-[#8696a0] text-[10px] px-md py-xs rounded shadow-xs uppercase tracking-wider font-semibold border border-[#e2d5c5]/40 dark:border-[#2f3b43]/30 font-code-sm">
+                                    {log.text}
+                                  </div>
+                                </div>
+                              );
+                            }
+
+                            const nameColor = getAgentColor(log.agent);
+
+                            return (
+                              <div key={idx} className="flex justify-start items-start gap-xs max-w-[85%] animate-fadeIn">
+                                {/* Message bubble */}
+                                <div className="bg-white dark:bg-[#202c33] text-[#111b21] dark:text-[#e9edef] rounded-lg rounded-tl-none p-sm shadow-xs border border-slate-200 dark:border-transparent min-w-[200px] relative">
+                                  {/* Sender name */}
+                                  <div className="font-bold text-[11px] mb-xs" style={{ color: nameColor }}>
+                                    {log.agent}
+                                  </div>
+                                  
+                                  {/* Message Text */}
+                                  <p className="text-xs leading-relaxed break-words pr-[45px] text-slate-800 dark:text-slate-100 font-body-md">
+                                    {log.text}
+                                  </p>
+
+                                  {/* Timestamp + ticks */}
+                                  <div className="absolute bottom-1 right-2 flex items-center gap-base select-none">
+                                    <span className="text-[9px] text-[#667781] dark:text-[#8696a0]">
+                                      {log.timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                    </span>
+                                    <span className="material-symbols-outlined text-[10px] text-[#53bdeb]">done_all</span>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                          <div ref={consoleEndRef} />
+                        </div>
                       </div>
                       
                       <div className="flex items-center justify-between py-xs border-t border-slate-200 dark:border-white/10 pt-sm">
@@ -1591,12 +1890,30 @@ export default function App() {
                             <p className="font-code-sm text-xs text-slate-500 dark:text-on-surface-variant mt-1">PROJECT_ID: {activeProject?.id}</p>
                           </div>
                           <div className="flex flex-wrap items-center gap-sm">
+                            {versionList && versionList.length > 1 && (
+                              <div className="flex items-center gap-xs bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-lg p-xs px-sm select-none" title="Idea versions">
+                                <span className="material-symbols-outlined text-sm text-slate-500 dark:text-on-surface-variant">history</span>
+                                {versionList.map((v, idx) => (
+                                  <button
+                                    key={v.version ?? idx}
+                                    onClick={() => { setActiveVersionIdx(idx); setActiveDebateStage("reviews"); }}
+                                    className={`px-sm py-base rounded-md text-[10px] font-bold uppercase tracking-wider transition-all border ${
+                                      idx === Math.min(activeVersionIdx, versionList.length - 1)
+                                        ? "bg-cyan-500 text-white border-transparent"
+                                        : "text-slate-600 dark:text-slate-300 border-transparent hover:bg-slate-200 dark:hover:bg-white/10"
+                                    }`}
+                                  >
+                                    Version {v.version ?? idx + 1}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
                             <button
                               onClick={handleRefineCurrentIdea}
                               className="bg-primary-container hover:bg-primary-container/80 text-on-primary-container font-label-xs text-label-xs py-sm px-md rounded-DEFAULT transition-all uppercase tracking-widest font-bold shadow-xs flex items-center gap-xs"
                             >
                               <span className="material-symbols-outlined text-xs">rocket_launch</span>
-                              {loadedResult?.refinement || innerResult?.moderator ? "Re-run Refinement" : "Refine This Idea"}
+                              {loadedResult?.refinement || innerResult?.moderator ? "Iterate (New Version)" : "Refine This Idea"}
                             </button>
                             <button onClick={() => { setSelectedAgentForChat("moderator"); setActiveTabSubView("chat"); }} className="bg-cyan-500/15 text-cyan-800 dark:text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/25 font-label-xs text-label-xs py-sm px-md rounded-DEFAULT transition-all uppercase tracking-widest font-bold shadow-xs flex items-center gap-xs">
                               <span className="material-symbols-outlined text-xs">gavel</span> Chat with Moderator
@@ -1772,8 +2089,8 @@ export default function App() {
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-md">
                           {["Innovation", "Feasibility", "Impact", "Technical", "Skeptic"].map(name => {
                             const key = name.toLowerCase();
-                            const reviews = innerResult.refined_reviews || innerResult.reviews || (innerResult.refinement ? innerResult.refinement.reviews : {}) || {};
-                            const reflections = innerResult.refined_reflections || innerResult.reflections || (innerResult.refinement ? innerResult.refinement.reflections : {}) || {};
+                            const reviews = innerResult.refined_reviews || innerResult.reviews || (innerRefinement ? innerRefinement.reviews : {}) || {};
+                            const reflections = innerResult.refined_reflections || innerResult.reflections || (innerRefinement ? innerRefinement.reflections : {}) || {};
                             
                             let revRaw = reviews[key] || reviews[name] || reviews[name.toLowerCase()] || reviews[name + " Agent"];
                             let reflRaw = reflections[key] || reflections[name] || reflections[name.toLowerCase()] || reflections[name + " Agent"];
@@ -1820,111 +2137,366 @@ export default function App() {
 
                     {/* SUBVIEW 3: VISUAL STRUCTURED DEBATE FLOW */}
                     {activeTabSubView === "debates" && (
-                      <div className="bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-md shadow-xs">
+                      <div className="bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-md shadow-xs text-left">
                         <div className="flex flex-col md:flex-row md:items-center justify-between border-b border-slate-200 dark:border-white/10 pb-sm gap-xs">
                           <div>
                             <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-cyan-300 flex items-center gap-xs select-none">
-                              <span className="material-symbols-outlined text-sm">hub</span> Visual Cross-Examination Argument Flow
+                              <span className="material-symbols-outlined text-sm">hub</span> Visual Multi-Stage Agent Workspace
                             </h3>
                             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                              Map of peer challenges, rebuttals, and concessions leading directly to final Moderator synthesis.
+                              Examine each agent's complete analysis, critique, peer challenge, and concession leading to final consensus.
                             </p>
                           </div>
                           <span className="font-code-sm text-[10px] bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 border border-cyan-500/20 px-xs py-base rounded uppercase font-bold self-start md:self-auto">
-                            A2A Debate Graph
+                            A2A debate rounds
                           </span>
                         </div>
 
-                        {/* Panel Node Visual Bar */}
-                        <div className="bg-slate-50 dark:bg-[#13141a] p-sm rounded-xl border border-slate-200 dark:border-white/5 flex flex-wrap items-center justify-between gap-sm font-code-sm text-xs select-none">
-                          <div className="flex items-center gap-xs text-amber-500 font-bold"><span className="material-symbols-outlined text-sm">tips_and_updates</span> Innovation</div>
-                          <span className="text-slate-400">➔</span>
-                          <div className="flex items-center gap-xs text-purple-500 font-bold"><span className="material-symbols-outlined text-sm">construction</span> Feasibility</div>
-                          <span className="text-slate-400">➔</span>
-                          <div className="flex items-center gap-xs text-blue-500 font-bold"><span className="material-symbols-outlined text-sm">stars</span> Impact</div>
-                          <span className="text-slate-400">➔</span>
-                          <div className="flex items-center gap-xs text-emerald-500 font-bold"><span className="material-symbols-outlined text-sm">developer_board</span> Technical</div>
-                          <span className="text-slate-400">➔</span>
-                          <div className="flex items-center gap-xs text-rose-500 font-bold"><span className="material-symbols-outlined text-sm">security_update_warning</span> Skeptic</div>
-                          <span className="text-slate-400">➔</span>
-                          <div className="flex items-center gap-xs text-cyan-400 font-bold"><span className="material-symbols-outlined text-sm">gavel</span> Moderator</div>
-                        </div>
+                        {/* Stage Tabs */}
+                        {innerRefinement && (innerRefinement.reviews || innerRefinement.reflections || innerRefinement.moderator) ? (
+                          <div className="flex flex-wrap items-center gap-xs bg-slate-100 dark:bg-white/5 p-xs rounded-xl border border-slate-200 dark:border-white/10 select-none">
+                            {[
+                              { id: "reviews", label: "Stage 1: Independent Analysis", icon: "troubleshoot" },
+                              { id: "debate", label: "Stage 2: Cross-Examination", icon: "forum" },
+                              { id: "reflections", label: "Stage 3: Peer Reflections", icon: "psychology" },
+                              { id: "moderator", label: "Stage 4: Consensus Synthesis", icon: "gavel" }
+                            ].map(stage => (
+                              <button
+                                key={stage.id}
+                                onClick={() => setActiveDebateStage(stage.id)}
+                                className={`px-md py-xs rounded-lg text-xs font-bold uppercase tracking-wider transition-all flex items-center gap-xs border ${
+                                  activeDebateStage === stage.id || (activeDebateStage === "proposals" && stage.id === "reviews")
+                                    ? "bg-cyan-500 text-white border-transparent shadow-sm"
+                                    : "text-slate-600 dark:text-slate-300 border-transparent hover:bg-slate-200 dark:hover:bg-white/10"
+                                }`}
+                              >
+                                <span className="material-symbols-outlined text-sm">{stage.icon}</span> {stage.label}
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="flex flex-wrap items-center gap-xs bg-slate-100 dark:bg-white/5 p-xs rounded-xl border border-slate-200 dark:border-white/10 select-none">
+                            {[
+                              { id: "proposals", label: "Stage 1: Agent Idea Proposals", icon: "tips_and_updates" },
+                              { id: "debate", label: "Stage 2: Candidate Debate", icon: "forum" }
+                            ].map(stage => (
+                              <button
+                                key={stage.id}
+                                onClick={() => setActiveDebateStage(stage.id)}
+                                className={`px-md py-xs rounded-lg text-xs font-bold uppercase tracking-wider transition-all flex items-center gap-xs border ${
+                                  activeDebateStage === stage.id || (activeDebateStage === "reviews" && stage.id === "proposals")
+                                    ? "bg-cyan-500 text-white border-transparent shadow-sm"
+                                    : "text-slate-600 dark:text-slate-300 border-transparent hover:bg-slate-200 dark:hover:bg-white/10"
+                                }`}
+                              >
+                                <span className="material-symbols-outlined text-sm">{stage.icon}</span> {stage.label}
+                              </button>
+                            ))}
+                          </div>
+                        )}
 
-                        {/* Visual Timeline of Exchanges with Centered Circles */}
-                        <div className="space-y-md max-h-[550px] overflow-y-auto pr-xs border border-slate-200 dark:border-white/5 bg-slate-50/50 dark:bg-[#0d0e12] p-md rounded-xl font-code-sm text-xs text-left">
-                          {(() => {
-                            const exchanges = getAllDebateExchanges(innerResult);
-                            if (exchanges.length === 0 && (!chats || chats.length === 0)) {
-                              return <div className="text-slate-500 dark:text-slate-400 text-center py-md">No structured debates recorded for this project yet. Click "Refine This Idea" to run the debate engine.</div>;
-                            }
-
-                            if (exchanges.length > 0) {
+                        {/* STAGE 1 (REFINEMENT): Independent Analysis */}
+                        {activeDebateStage === "reviews" && innerRefinement && innerRefinement.reviews && (
+                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-md mt-sm animate-fadeIn">
+                            {["Innovation", "Feasibility", "Impact", "Technical", "Skeptic"].map(name => {
+                              const key = name.toLowerCase();
+                              const reviews = innerRefinement.reviews || {};
+                              const rev = reviews[key] || reviews[name] || reviews[name.toLowerCase()] || reviews[name + " Agent"];
+                              
+                              if (!rev) return null;
+                              
+                              const stance = rev.stance || "neutral";
+                              const isChallenge = stance.toLowerCase().includes("disagree") || stance.toLowerCase().includes("challenge");
+                              const isConcur = stance.toLowerCase().includes("concur") || stance.toLowerCase().includes("agree");
+                              
                               return (
-                                <div className="relative space-y-lg py-sm max-w-2xl mx-auto before:absolute before:inset-0 before:left-1/2 before:-translate-x-1/2 before:w-0.5 before:bg-slate-300 dark:before:bg-white/10">
-                                  {exchanges.map((ex, idx) => {
-                                    const isDisagree = ex.stance && (ex.stance.toLowerCase().includes("disagree") || ex.stance.toLowerCase().includes("challenge"));
-                                    const isEven = idx % 2 === 0;
-                                    return (
-                                      <div key={idx} className="relative flex items-center justify-center my-md">
-                                        {/* Timeline Step Node Circle centered directly on vertical line */}
-                                        <div className={`absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-4 h-4 rounded-full border-2 z-10 ${isDisagree ? "bg-rose-500 border-rose-200 shadow-[0_0_8px_rgba(244,63,94,0.5)]" : "bg-emerald-500 border-emerald-200 shadow-[0_0_8px_rgba(16,185,129,0.5)]"}`}></div>
-                                        
-                                        {/* Card placed on left or right */}
-                                        <div className={`w-[calc(50%-1.5rem)] ${isEven ? "mr-auto text-right" : "ml-auto text-left"}`}>
-                                          <div className="bg-white dark:bg-[#161820] border border-slate-200 dark:border-white/10 p-sm rounded-xl shadow-xs space-y-xs hover:border-cyan-500/50 transition-all">
-                                            <div className={`flex flex-wrap items-center gap-xs border-b border-slate-100 dark:border-white/5 pb-xs ${isEven ? "justify-end" : "justify-start"}`}>
-                                              <span className="font-bold text-cyan-700 dark:text-cyan-300 text-xs">{ex.speaker}</span>
-                                              <span className="material-symbols-outlined text-xs text-slate-400">arrow_forward</span>
-                                              <span className="text-slate-600 dark:text-slate-300 text-xs">{ex.target}</span>
-                                              <span className={`text-[9px] px-xs py-base rounded uppercase font-bold tracking-wider ${isDisagree ? "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/30" : "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30"}`}>
-                                                {ex.stance}
-                                              </span>
-                                            </div>
-                                            <p className="text-slate-700 dark:text-slate-200 leading-relaxed text-xs pt-xs">
-                                              "{ex.argument}"
-                                            </p>
+                                <div key={name} className="bg-white dark:bg-[#13141a] border border-slate-200 dark:border-white/10 p-md rounded-xl shadow-sm flex flex-col justify-between text-left space-y-md">
+                                  <div>
+                                    <div className="flex justify-between items-center border-b border-slate-100 dark:border-white/5 pb-xs">
+                                      <div className="flex items-center gap-xs">
+                                        <span className="material-symbols-outlined text-sm" style={{ color: getAgentColor(name) }}>
+                                          {name === "Skeptic" ? "security_update_warning" : name === "Innovation" ? "tips_and_updates" : name === "Feasibility" ? "construction" : name === "Impact" ? "stars" : "developer_board"}
+                                        </span>
+                                        <h4 className="font-bold text-slate-800 dark:text-white text-xs uppercase tracking-wide">{name} Agent</h4>
+                                      </div>
+                                      <span className="text-sm font-bold text-slate-900 dark:text-cyan-400 font-display-lg">{rev.score !== undefined ? rev.score : 7}/10</span>
+                                    </div>
+                                    <div className="mt-sm flex items-center justify-between">
+                                      <span className="text-[10px] text-slate-500 uppercase tracking-wider font-bold">Stance Verdict</span>
+                                      <span className={`text-[9px] px-xs py-base rounded uppercase font-bold tracking-wider ${
+                                        isChallenge ? "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/30" : 
+                                        isConcur ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30" :
+                                        "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/30"
+                                      }`}>
+                                        {stance}
+                                      </span>
+                                    </div>
+                                    <div className="mt-sm space-y-sm text-xs leading-relaxed text-slate-700 dark:text-slate-300">
+                                      <div>
+                                        <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold mb-base">Critique & Analysis</span>
+                                        <p className="whitespace-pre-wrap">{rev.critique || "Analysis complete."}</p>
+                                      </div>
+                                      {rev.improvements && rev.improvements.length > 0 && (
+                                        <div>
+                                          <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold mb-base">Suggested Improvements</span>
+                                          <ul className="list-disc pl-sm space-y-base text-[11px]">
+                                            {rev.improvements.map((imp, idx) => (
+                                              <li key={idx}>{imp}</li>
+                                            ))}
+                                          </ul>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {/* STAGE 1 (GENERATION): Agent Idea Proposals */}
+                        {activeDebateStage === "proposals" && innerResult?.proposals && (
+                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-md mt-sm animate-fadeIn">
+                            {Object.entries(innerResult.proposals).map(([agent, val]) => {
+                              if (!val) return null;
+                              const displayAgent = agent.charAt(0).toUpperCase() + agent.slice(1);
+                              
+                              return (
+                                <div key={agent} className="bg-white dark:bg-[#13141a] border border-slate-200 dark:border-white/10 p-md rounded-xl shadow-sm flex flex-col justify-between text-left space-y-md">
+                                  <div>
+                                    <div className="flex justify-between items-center border-b border-slate-100 dark:border-white/5 pb-xs">
+                                      <div className="flex items-center gap-xs">
+                                        <span className="material-symbols-outlined text-sm" style={{ color: getAgentColor(agent) }}>
+                                          {agent === "ideator" ? "lightbulb" : agent === "researcher" ? "search" : "query_stats"}
+                                        </span>
+                                        <h4 className="font-bold text-slate-800 dark:text-white text-xs uppercase tracking-wide">{displayAgent} Agent</h4>
+                                      </div>
+                                      <span className="text-[10px] text-slate-500 uppercase tracking-wider font-bold">Proposal Output</span>
+                                    </div>
+                                    <div className="mt-sm space-y-sm text-xs leading-relaxed text-slate-700 dark:text-slate-300">
+                                      {val.ideas ? (
+                                        // Ideator Shortlist
+                                        <div>
+                                          <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold mb-base">Shortlisted Candidates</span>
+                                          <div className="space-y-sm mt-xs">
+                                            {val.ideas.map((cand, idx) => (
+                                              <div key={idx} className="bg-slate-50 dark:bg-white/5 p-xs rounded border border-slate-100 dark:border-white/5">
+                                                <div className="font-bold text-slate-900 dark:text-cyan-300 mb-base">{cand.title}</div>
+                                                <p className="text-[11px] leading-normal">{cand.idea}</p>
+                                                <div className="text-[9px] text-slate-400 mt-base">Hackathon Fit: {cand.hackathon_fit}/10</div>
+                                              </div>
+                                            ))}
                                           </div>
                                         </div>
-                                      </div>
-                                    );
-                                  })}
-
-                                  {/* Final Conclusion Synthesis Card Centered */}
-                                  {innerResult?.moderator && (
-                                    <div className="relative flex flex-col items-center pt-md max-w-lg mx-auto text-center">
-                                      <div className="w-6 h-6 rounded-full bg-cyan-400 border-2 border-white flex items-center justify-center z-10 shadow-md mb-xs">
-                                        <span className="material-symbols-outlined text-xs text-black font-bold">check</span>
-                                      </div>
-                                      <div className="w-full bg-cyan-500/10 border border-cyan-500/30 p-md rounded-xl space-y-xs">
-                                        <div className="flex items-center justify-center gap-xs text-cyan-700 dark:text-cyan-300 font-bold text-xs uppercase">
-                                          <span className="material-symbols-outlined text-sm">gavel</span> Moderator Final Synthesis
+                                      ) : (
+                                        // CandidateProposal (Researcher/Strategist)
+                                        <div>
+                                          <div className="bg-slate-50 dark:bg-white/5 p-xs rounded border border-slate-100 dark:border-white/5 mb-sm">
+                                            <div className="font-bold text-slate-900 dark:text-cyan-300 mb-base">{val.title}</div>
+                                            <p className="text-[11px] leading-normal">{val.idea}</p>
+                                            <div className="text-[9px] text-slate-400 mt-base">Hackathon Fit: {val.hackathon_fit}/10</div>
+                                          </div>
+                                          {val.rationale && (
+                                            <div>
+                                              <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold mb-base">Proposal Rationale</span>
+                                              <p>{val.rationale}</p>
+                                            </div>
+                                          )}
                                         </div>
-                                        <p className="text-slate-800 dark:text-slate-100 text-xs leading-relaxed font-medium">
-                                          {innerResult.moderator.refined_idea}
-                                        </p>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {/* STAGE 2: Debate Timeline */}
+                        {activeDebateStage === "debate" && (
+                          <div className="space-y-md mt-sm animate-fadeIn">
+                            {/* Panel Node Visual Bar */}
+                            <div className="bg-slate-50 dark:bg-[#13141a] p-sm rounded-xl border border-slate-200 dark:border-white/5 flex flex-wrap items-center justify-between gap-sm font-code-sm text-xs select-none">
+                              <div className="flex items-center gap-xs text-amber-500 font-bold"><span className="material-symbols-outlined text-sm">tips_and_updates</span> Innovation</div>
+                              <span className="text-slate-400">➔</span>
+                              <div className="flex items-center gap-xs text-purple-500 font-bold"><span className="material-symbols-outlined text-sm">construction</span> Feasibility</div>
+                              <span className="text-slate-400">➔</span>
+                              <div className="flex items-center gap-xs text-blue-500 font-bold"><span className="material-symbols-outlined text-sm">stars</span> Impact</div>
+                              <span className="text-slate-400">➔</span>
+                              <div className="flex items-center gap-xs text-emerald-500 font-bold"><span className="material-symbols-outlined text-sm">developer_board</span> Technical</div>
+                              <span className="text-slate-400">➔</span>
+                              <div className="flex items-center gap-xs text-rose-500 font-bold"><span className="material-symbols-outlined text-sm">security_update_warning</span> Skeptic</div>
+                              <span className="text-slate-400">➔</span>
+                              <div className="flex items-center gap-xs text-cyan-400 font-bold"><span className="material-symbols-outlined text-sm">gavel</span> Moderator</div>
+                            </div>
+
+                            {/* Visual Timeline of Exchanges */}
+                            <div className="space-y-md max-h-[550px] overflow-y-auto pr-xs border border-slate-200 dark:border-white/5 bg-slate-50/50 dark:bg-[#0d0e12] p-md rounded-xl font-code-sm text-xs text-left">
+                              {(() => {
+                                const exchanges = getAllDebateExchanges(innerResult);
+                                if (exchanges.length === 0 && (!chats || chats.length === 0)) {
+                                  return <div className="text-slate-500 dark:text-slate-400 text-center py-md font-sans">No structured debates recorded for this project yet. Click "Refine This Idea" to run the debate engine.</div>;
+                                }
+
+                                if (exchanges.length > 0) {
+                                  return (
+                                    <div className="relative space-y-lg py-sm max-w-2xl mx-auto before:absolute before:inset-0 before:left-1/2 before:-translate-x-1/2 before:w-0.5 before:bg-slate-300 dark:before:bg-white/10 font-code-sm">
+                                      {exchanges.map((ex, idx) => {
+                                        const isDisagree = ex.stance && (ex.stance.toLowerCase().includes("disagree") || ex.stance.toLowerCase().includes("challenge"));
+                                        const isEven = idx % 2 === 0;
+                                        return (
+                                          <div key={idx} className="relative flex items-center justify-center my-md">
+                                            {/* Timeline Node */}
+                                            <div className={`absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-4 h-4 rounded-full border-2 z-10 ${isDisagree ? "bg-rose-500 border-rose-200 shadow-[0_0_8px_rgba(244,63,94,0.5)]" : "bg-emerald-500 border-emerald-200 shadow-[0_0_8px_rgba(16,185,129,0.5)]"}`}></div>
+                                            
+                                            <div className={`w-[calc(50%-1.5rem)] ${isEven ? "mr-auto text-right" : "ml-auto text-left"}`}>
+                                              <div className="bg-white dark:bg-[#161820] border border-slate-200 dark:border-white/10 p-sm rounded-xl shadow-xs space-y-xs hover:border-cyan-500/50 transition-all">
+                                                <div className={`flex flex-wrap items-center gap-xs border-b border-slate-100 dark:border-white/5 pb-xs ${isEven ? "justify-end" : "justify-start"}`}>
+                                                  <span className="font-bold text-cyan-700 dark:text-cyan-300 text-xs">{ex.speaker}</span>
+                                                  <span className="material-symbols-outlined text-xs text-slate-400">arrow_forward</span>
+                                                  <span className="text-slate-600 dark:text-slate-300 text-xs">{ex.target}</span>
+                                                  <span className={`text-[9px] px-xs py-base rounded uppercase font-bold tracking-wider ${isDisagree ? "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/30" : "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30"}`}>
+                                                    {ex.stance}
+                                                  </span>
+                                                </div>
+                                                <p className="text-slate-700 dark:text-slate-200 leading-relaxed text-xs pt-xs font-sans">
+                                                  "{ex.argument}"
+                                                </p>
+                                              </div>
+                                            </div>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  );
+                                }
+
+                                return (
+                                  <div className="space-y-sm max-w-xl mx-auto font-sans">
+                                    {chats.map((chat, idx) => (
+                                      <div key={idx} className="bg-white dark:bg-[#161820] border border-slate-200 dark:border-white/10 p-sm rounded-xl space-y-xs">
+                                        <div className="flex items-center justify-between border-b border-slate-100 dark:border-white/5 pb-xs">
+                                          <span className="font-bold text-slate-800 dark:text-cyan-300 uppercase">{chat.sender}</span>
+                                          <span className="text-[9px] text-slate-400">{new Date(chat.created_at).toLocaleTimeString()}</span>
+                                        </div>
+                                        <p className="text-slate-700 dark:text-slate-200 leading-relaxed text-xs">{chat.message}</p>
                                       </div>
+                                    ))}
+                                  </div>
+                                );
+                              })()}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* STAGE 3: Peer Reflections */}
+                        {activeDebateStage === "reflections" && innerRefinement && innerRefinement.reflections && (
+                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-md mt-sm animate-fadeIn">
+                            {["Innovation", "Feasibility", "Impact", "Technical", "Skeptic"].map(name => {
+                              const key = name.toLowerCase();
+                              const reflections = innerRefinement.reflections || {};
+                              const refl = reflections[key] || reflections[name] || reflections[name.toLowerCase()] || reflections[name + " Agent"];
+                              
+                              if (!refl) return null;
+                              
+                              const original = refl.original_stance || "neutral";
+                              const updated = refl.updated_stance || "concur";
+                              
+                              return (
+                                <div key={name} className="bg-white dark:bg-[#13141a] border border-slate-200 dark:border-white/10 p-md rounded-xl shadow-sm flex flex-col justify-between text-left space-y-md">
+                                  <div>
+                                    <div className="flex justify-between items-center border-b border-slate-100 dark:border-white/5 pb-xs">
+                                      <div className="flex items-center gap-xs">
+                                        <span className="material-symbols-outlined text-sm" style={{ color: getAgentColor(name) }}>
+                                          psychology
+                                        </span>
+                                        <h4 className="font-bold text-slate-800 dark:text-white text-xs uppercase tracking-wide">{name} Agent</h4>
+                                      </div>
+                                      <div className="flex items-center gap-xs font-bold text-[10px] uppercase">
+                                        <span className="text-slate-400">{original}</span>
+                                        <span className="text-slate-400 font-sans">➔</span>
+                                        <span className="text-emerald-500">{updated}</span>
+                                      </div>
+                                    </div>
+                                    
+                                    <div className="mt-sm space-y-sm text-xs leading-relaxed text-slate-700 dark:text-slate-300">
+                                      <div>
+                                        <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold mb-base">Reflection Rationale</span>
+                                        <p>{refl.reflection_rationale || "Conceded points and accepted peer reviews."}</p>
+                                      </div>
+                                      
+                                      {refl.concessions && refl.concessions.length > 0 && (
+                                        <div>
+                                          <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold mb-base">Concessions Made</span>
+                                          <ul className="list-disc pl-sm space-y-base text-[11px]">
+                                            {refl.concessions.map((conc, idx) => (
+                                              <li key={idx}>{conc}</li>
+                                            ))}
+                                          </ul>
+                                        </div>
+                                      )}
+                                      
+                                      {refl.updated_critique && (
+                                        <div>
+                                          <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold mb-base">Updated Critique</span>
+                                          <p className="text-[11px] whitespace-pre-wrap">{refl.updated_critique}</p>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {/* STAGE 4: Consensus Synthesis */}
+                        {activeDebateStage === "moderator" && innerRefinement && innerRefinement.moderator && (
+                          <div className="max-w-2xl mx-auto space-y-md mt-sm animate-fadeIn text-left font-sans">
+                            {innerRefinement.moderator ? (
+                              <div className="bg-cyan-500/10 border border-cyan-500/30 p-md rounded-xl space-y-sm">
+                                <div className="flex items-center justify-between border-b border-cyan-500/20 pb-xs">
+                                  <div className="flex items-center gap-xs text-cyan-700 dark:text-cyan-300 font-bold text-xs uppercase font-code-sm">
+                                    <span className="material-symbols-outlined text-sm">gavel</span> Moderator Verdict
+                                  </div>
+                                  <span className={`text-[9px] px-xs py-base rounded uppercase font-bold tracking-wider bg-cyan-500 text-white font-code-sm`}>
+                                    {innerRefinement.moderator.verdict || "Consensus Approved"}
+                                  </span>
+                                </div>
+                                <div className="space-y-sm text-xs leading-relaxed text-slate-800 dark:text-slate-100">
+                                  <div>
+                                    <span className="text-[9px] uppercase tracking-wider text-cyan-600 dark:text-cyan-400 block font-bold font-code-sm mb-base">Consolidated Refined Concept</span>
+                                    <p className="font-semibold">{innerRefinement.moderator.refined_idea}</p>
+                                  </div>
+                                  
+                                  {innerRefinement.moderator.innovations && innerRefinement.moderator.innovations.length > 0 && (
+                                    <div>
+                                      <span className="text-[9px] uppercase tracking-wider text-cyan-600 dark:text-cyan-400 block font-bold font-code-sm mb-base">Key Innovations Retained</span>
+                                      <ul className="list-disc pl-sm space-y-base text-[11px]">
+                                        {innerRefinement.moderator.innovations.map((item, idx) => (
+                                          <li key={idx}>{item}</li>
+                                        ))}
+                                      </ul>
+                                    </div>
+                                  )}
+
+                                  {innerRefinement.moderator.risks && innerRefinement.moderator.risks.length > 0 && (
+                                    <div>
+                                      <span className="text-[9px] uppercase tracking-wider text-rose-500 block font-bold font-code-sm mb-base">Resolved Key Risks</span>
+                                      <ul className="list-disc pl-sm space-y-base text-[11px]">
+                                        {innerRefinement.moderator.risks.map((item, idx) => (
+                                          <li key={idx}>{item}</li>
+                                        ))}
+                                      </ul>
                                     </div>
                                   )}
                                 </div>
-                              );
-                            }
-
-                            // Fallback if structured chats exist
-                            return (
-                              <div className="space-y-sm max-w-xl mx-auto">
-                                {chats.map((chat, idx) => (
-                                  <div key={idx} className="bg-white dark:bg-[#161820] border border-slate-200 dark:border-white/10 p-sm rounded-xl space-y-xs">
-                                    <div className="flex items-center justify-between border-b border-slate-100 dark:border-white/5 pb-xs">
-                                      <span className="font-bold text-slate-800 dark:text-cyan-300 uppercase">{chat.sender}</span>
-                                      <span className="text-[9px] text-slate-400">{new Date(chat.created_at).toLocaleTimeString()}</span>
-                                    </div>
-                                    <p className="text-slate-700 dark:text-slate-200 leading-relaxed text-xs">{chat.message}</p>
-                                  </div>
-                                ))}
                               </div>
-                            );
-                          })()}
-                        </div>
+                            ) : (
+                              <div className="text-slate-500 text-center py-md font-sans">No moderator synthesis output available.</div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     )}
 
