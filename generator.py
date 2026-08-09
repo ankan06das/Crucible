@@ -7,6 +7,7 @@ from a2a_router.client import A2APanelClient
 from a2a_router.server import mount
 from agents.registry import CONCLUDER_SPEC, GENERATOR_SPECS
 from core.research import research_topic
+from core.summary import summarize
 from llm import LLM
 from orchestrator import run_pipeline
 from schemas.debate import DebateRound
@@ -35,11 +36,7 @@ def _print_phase(title: str) -> None:
 
 def _print_step(step: str, value: object) -> None:
     print(f"\n--- {step} ---")
-    if isinstance(value, list):
-        for item in value:
-            print(f"- {item}")
-    else:
-        print(value.model_dump_json(indent=2))
+    print(summarize(value))
 
 
 async def _run_tasks(
