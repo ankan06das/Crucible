@@ -22,9 +22,9 @@ from schemas.generation import (
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
-# Per-persona generation skill + schema. Ideator shortlists 4-5; the others propose one.
+# Per-persona generation skill + schema
 GEN_SKILLS: dict[str, tuple[str, type]] = {
-    "ideator": ("generate_ideas", IdeaShortlist),
+    "ideator": ("generate_idea", CandidateProposal),
     "researcher": ("generate_idea", CandidateProposal),
     "strategist": ("generate_idea", CandidateProposal),
 }
@@ -207,93 +207,49 @@ async def generate_idea(
         fact_sheet = _format_fact_sheet(brief)
         context = _format_context(req)
 
-        # Parallel independent generation (groupthink-free)
+        # Single independent generation
         await _emit_phase(emit, "proposal", "Idea Proposals")
-        proposal_tasks = {}
-        for spec in GENERATOR_SPECS:
-            skill, schema = GEN_SKILLS[spec.name]
-            proposal_tasks[spec.name] = asyncio.create_task(
-                panel.ask(spec.name, f"{fact_sheet}\n\n{context}", skill, schema)
-            )
-        proposals = await _run_tasks(
-            "IDEA PROPOSALS",
-            proposal_tasks,
-            show_results=True,
-            emit=emit,
-            phase="proposal",
+        ideator_spec = next((s for s in GENERATOR_SPECS if s.name == "ideator"), GENERATOR_SPECS[1])
+        proposal = await panel.ask(
+            ideator_spec.name,
+            f"{fact_sheet}\n\n{context}",
+            "generate_idea",
+            CandidateProposal
         )
-
-        candidates = _unpack_proposals(proposals)
-        candidate_board = _format_candidates(candidates)
-
-        # Generation debate: everyone argues over the pooled candidate board by title
-        await _emit_phase(emit, "debate", "Generation Debate")
-        debate_tasks = {}
-        for spec in GENERATOR_SPECS:
-            prompt = (
-                f"{fact_sheet}\n\n{candidate_board}\n\n"
-                f"Your full output:\n{proposals[spec.name].model_dump_json(indent=2)}\n\n"
-                f"Debate the candidate ideas by title. Ground every argument in a fact or data "
-                f"gap and defend or attack the strongest candidates for a hackathon."
-            )
-            debate_tasks[spec.name] = asyncio.create_task(
-                panel.ask(spec.name, prompt, "debate", DebateRound)
-            )
-        debates = await _run_tasks(
-            "GENERATION DEBATE",
-            debate_tasks,
-            show_results=True,
-            emit=emit,
-            phase="debate",
-        )
-
-        # Concluder picks the topic from the full pool
-        _print_phase("GENERATION CONCLUSION")
-        concluder_input = "\n\n".join(
-            [
-                f"Topic:\n{req.topic}",
-                fact_sheet,
-                candidate_board,
-                "\n".join(
-                    f"### {spec.display_name} Agent debate\n{debates[spec.name]}"
-                    for spec in GENERATOR_SPECS
-                ),
-            ]
-        )
-        conclusion = await panel.ask(
-            CONCLUDER_SPEC.name, concluder_input, "conclude", GenerationConclusion
-        )
-        _print_step("GENERATION CONCLUSION", conclusion)
+        _print_step("IDEA PROPOSAL", proposal)
+        if emit:
+            await emit({"type": "agent_done", "phase": "proposal", "agent": ideator_spec.name, "data": proposal.model_dump()})
 
         # Auto-feed into the refinement pipeline
         _print_phase("REFINEMENT PIPELINE")
         refined = await run_pipeline(
             app,
-            conclusion.selected_idea,
+            proposal.title, # Using the single idea's title
             idea_context=context,
             emit=emit,
         )
 
-        shortlist = next(
-            (v for v in proposals.values() if isinstance(v, IdeaShortlist)), None
-        )
         result = GenerationResult(
             research=brief,
-            shortlist=shortlist,
-            candidates=candidates,
-            proposals=proposals,  # type: ignore[arg-type]
-            debates=debates,  # type: ignore[arg-type]
-            conclusion=conclusion,
+            shortlist=None,
+            candidates=[proposal],
+            proposals={ideator_spec.name: proposal},
+            debates={},
+            conclusion=GenerationConclusion(
+                selected_idea=proposal.title,
+                rationale="Only one idea generated.",
+                key_facts=[],
+                ranked_ideas=[proposal.title],
+                open_assumptions=[]
+            ),
             refined_reviews=refined.reviews,
             refined_debates=refined.debate,
             refined_reflections=refined.reflections,
-            moderator=refined.moderator,
+            moderator=refined.moderator
         )
 
         from core.artifacts import new_run_id, save_generation_result
-
-        path = save_generation_result(new_run_id(), result)
-        print(f"\nGENERATION RESULT SAVED -> {path}")
+        save_generation_result(new_run_id("gen"), result)
         return result
     finally:
         await panel.close()

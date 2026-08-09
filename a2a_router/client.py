@@ -57,11 +57,18 @@ class A2APanelClient:
                 msg = response.message
                 for part in msg.parts:
                     if part.HasField("data"):
-                        json_str = json_format.MessageToDict(part.data)["structValue"]["fields"]["data"]["stringValue"]
+                        dict_data = json_format.MessageToDict(part.data)
                         try:
+                            if "structValue" in dict_data:
+                                json_str = dict_data["structValue"]["fields"]["data"]["stringValue"]
+                            elif "stringValue" in dict_data:
+                                json_str = dict_data["stringValue"]
+                            else:
+                                json_str = json.dumps(dict_data)
+                            
                             return schema.model_validate_json(json_str)
                         except Exception as e:
-                            print(f"[ERROR] Invalid JSON: {e}")
+                            print(f"[ERROR] Invalid JSON or missing key. dict_data: {dict_data}, error: {e}")
                             try:
                                 # Attempt more lenient parsing
                                 cleaned = json_str.replace('\\n', ' ').replace('\\r', '').replace('\\', '')

@@ -99,6 +99,15 @@ def summarize(value) -> str:
             lines.append(f"Data gaps: {gaps}")
         return "\n".join(lines) if lines else "Fact sheet complete."
 
+    # IdeaShortlist
+    if isinstance(d, dict) and "ideas" in d and "recommended" in d:
+        lines = []
+        for candidate in d.get("ideas") or []:
+            c = _dump(candidate)
+            line = f"{c.get('title')} · fit {c.get('hackathon_fit')}/10 — {_clip(c.get('idea'))}"
+            lines.append(line)
+        return "\n".join(lines)
+
     # CandidateProposal / shortlist item
     if isinstance(d, dict) and "title" in d and "idea" in d:
         line = f"{d.get('title')} · fit {d.get('hackathon_fit')}/10 — {_clip(d.get('idea'))}"

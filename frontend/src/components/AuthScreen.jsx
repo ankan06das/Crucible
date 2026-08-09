@@ -3,7 +3,7 @@ import { useAppContext } from "../context/AppContext";
 import { Button, Card, Field, inputCls } from "./ui";
 import { GoogleLogin } from '@react-oauth/google';
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 export default function AuthScreen() {
   const {

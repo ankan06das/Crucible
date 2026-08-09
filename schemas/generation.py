@@ -47,7 +47,7 @@ class ResearchBrief(BaseModel):
 
 
 class CandidateProposal(BaseModel):
-    agent: str = Field(description="The name of the proposing agent.")
+    agent: str = Field(default="", description="The name of the proposing agent.")
     title: str = Field(
         description="A short, unique 2-4 word title used to reference this idea in debate and ranking."
     )
