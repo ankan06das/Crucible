@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Awaitable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from a2a_router.client import A2APanelClient
 from a2a_router.server import mount
@@ -44,12 +44,25 @@ def _print_step(step: str, value: object) -> None:
     print(summarize(value))
 
 
+async def _emit_phase(
+    emit: Callable[[dict], Awaitable[None]] | None,
+    phase: str,
+    title: str | None = None,
+) -> None:
+    if emit:
+        await emit({"type": "phase_start", "phase": phase, "title": title or phase})
+
+
 async def _run_tasks(
     title: str,
     tasks: dict[str, Awaitable[object]],
     show_results: bool = False,
+    emit: Callable[[dict], Awaitable[None]] | None = None,
+    phase: str | None = None,
 ) -> dict[str, object]:
     _print_phase(title)
+    phase = phase or title.lower().replace(" ", "_")
+
     async def _named(name: str, awaitable: Awaitable[object]) -> tuple[str, object]:
         return name, await awaitable
 
@@ -59,6 +72,11 @@ async def _run_tasks(
         name, value = await completed
         done[name] = value
         print(f"[{title}] {name} finished")
+        if emit:
+            data = value.model_dump() if hasattr(value, "model_dump") else value
+            await emit(
+                {"type": "agent_done", "phase": phase, "agent": name, "data": data}
+            )
         if show_results:
             _print_step(f"{title} - {name}", value)
     return done
@@ -99,7 +117,9 @@ def _format_brief(brief: ResearchBrief | None) -> str:
     return "\n".join(lines)
 
 
-async def _research_judges(panel, llm, idea: str) -> dict[str, ResearchBrief]:
+async def _research_judges(
+    llm, idea: str, emit: Callable[[dict], Awaitable[None]] | None = None
+) -> dict[str, ResearchBrief]:
     if not settings.web_research_enabled:
         return {}
     tasks = {}
@@ -107,22 +127,21 @@ async def _research_judges(panel, llm, idea: str) -> dict[str, ResearchBrief]:
         tasks[spec.name] = asyncio.create_task(
             research_for_agent(idea, spec.search_hint, llm)
         )
-    return await _run_tasks("JUDGE WEB RESEARCH", tasks, show_results=False)
-
-
-async def _research_judges(llm, idea: str) -> dict[str, ResearchBrief]:
-    if not settings.web_research_enabled:
-        return {}
-    tasks = {}
-    for spec in JUDGE_SPECS:
-        tasks[spec.name] = asyncio.create_task(
-            research_for_agent(idea, spec.search_hint, llm)
-        )
-    return await _run_tasks("JUDGE WEB RESEARCH", tasks, show_results=False)
+    await _emit_phase(emit, "research", "Judge Web Research")
+    return await _run_tasks(
+        "JUDGE WEB RESEARCH",
+        tasks,
+        show_results=False,
+        emit=emit,
+        phase="research",
+    )
 
 
 async def run_pipeline(
-    app: "FastAPI", idea: str, idea_context: str | None = None
+    app: "FastAPI",
+    idea: str,
+    idea_context: str | None = None,
+    emit: Callable[[dict], Awaitable[None]] | None = None,
 ) -> PipelineResult:
     from llm import LLM
 
@@ -136,9 +155,10 @@ async def run_pipeline(
             idea_prompt = f"{idea_context}\n\n{idea_prompt}"
 
         # Phase 1b - Independent per-judge web research (parallel, scoped by lens)
-        result.research = await _research_judges(llm, idea)
+        result.research = await _research_judges(llm, idea, emit=emit)
 
         # Phase 2 - Independent analysis (parallel, groupthink-free)
+        await _emit_phase(emit, "review", "Independent Reviews")
         review_tasks = {}
         for spec in JUDGE_SPECS:
             brief = result.research.get(spec.name)
@@ -150,10 +170,17 @@ async def run_pipeline(
             review_tasks[spec.name] = panel.ask(
                 spec.name, prompt, "review_idea", AgentReview
             )
-        reviews = await _run_tasks("INDEPENDENT REVIEWS", review_tasks, show_results=True)
+        reviews = await _run_tasks(
+            "INDEPENDENT REVIEWS",
+            review_tasks,
+            show_results=True,
+            emit=emit,
+            phase="review",
+        )
         result.reviews = reviews  # type: ignore[assignment]
 
         # Phase 3 - Debate
+        await _emit_phase(emit, "debate", "Debate Engine")
         debate_tasks = {}
         for spec in JUDGE_SPECS:
             peers = "\n\n".join(
@@ -172,10 +199,17 @@ async def run_pipeline(
             debate_tasks[spec.name] = panel.ask(
                 spec.name, prompt, "debate", DebateRound
             )
-        debates = await _run_tasks("DEBATE", debate_tasks, show_results=True)
+        debates = await _run_tasks(
+            "DEBATE",
+            debate_tasks,
+            show_results=True,
+            emit=emit,
+            phase="debate",
+        )
         result.debate = debates  # type: ignore[assignment]
 
         # Phase 4 - Reflection
+        await _emit_phase(emit, "reflection", "Reflection Round")
         reflection_tasks = {}
         for spec in JUDGE_SPECS:
             transcript = _join_section("Debate transcript", debates)
@@ -194,10 +228,17 @@ async def run_pipeline(
             reflection_tasks[spec.name] = panel.ask(
                 spec.name, own, "reflect", Reflection
             )
-        reflections = await _run_tasks("REFLECTIONS", reflection_tasks, show_results=True)
+        reflections = await _run_tasks(
+            "REFLECTIONS",
+            reflection_tasks,
+            show_results=True,
+            emit=emit,
+            phase="reflection",
+        )
         result.reflections = reflections  # type: ignore[assignment]
 
         # Phase 5 - Moderator
+        await _emit_phase(emit, "moderator", "Moderator Synthesis")
         _print_phase("MODERATOR SYNTHESIS")
         moderator_input = "\n\n".join(
             [
@@ -211,6 +252,15 @@ async def run_pipeline(
             MODERATOR_SPEC.name, moderator_input, "moderate", ModeratorOutput
         )  # type: ignore[assignment]
         _print_step("MODERATOR SYNTHESIS", result.moderator)
+        if emit:
+            await emit(
+                {
+                    "type": "agent_done",
+                    "phase": "moderator",
+                    "agent": MODERATOR_SPEC.name,
+                    "data": result.moderator.model_dump(),
+                }
+            )
 
         from core.artifacts import new_run_id, save_pipeline_result
 

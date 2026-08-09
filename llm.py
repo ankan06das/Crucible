@@ -49,6 +49,22 @@ class LLM:
             raise ValueError("LLM returned no content")
         return content
 
+    async def stream(self, prompt: str):
+        """Yield chat completion text deltas as they are generated."""
+        async with _featherless_slot():
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                reasoning_effort='none',
+                stream=True,
+            )
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+
     async def generate_json(self, prompt: str, response_format:type[BaseModel]) -> type[BaseModel]:
         schema = response_format.model_json_schema()
         system_prompt = f"""

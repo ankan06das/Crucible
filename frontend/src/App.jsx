@@ -355,27 +355,25 @@ export default function App() {
 
   const selectCandidateIdea = async (candidate) => {
     if (!activeProject) return;
-    setCandidateSelectionLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/projects/${activeProject.id}/select-candidate`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
-        },
-        body: JSON.stringify({ title: candidate.title || activeProject.name, idea: candidate.idea || activeProject.name })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        loadProjectDetails(data.project_id, selectedCandidateIdx);
-      } else {
-        alert("Failed to initialize debate refinement for chosen topic");
+    setCandidateSelectionLoading(false);
+    setActiveTab("running");
+    startProgressTimer();
+    setConsoleLogs([]);
+    appendConsoleLine("Deploying expert agent panel for refinement debate...", "#7dd3fc");
+
+    await streamPipeline(
+      `${API_BASE}/api/projects/${activeProject.id}/select-candidate`,
+      { title: candidate.title || activeProject.name, idea: candidate.idea || activeProject.name },
+      {
+        onEvent: handlePipelineEvent,
+        onError: (err) => {
+          stopProgressTimer();
+          appendConsoleLine(`[ERROR] Failed to initialize refinement: ${err.message}`, "#ffb4ab");
+          alert("Failed to initialize debate refinement for chosen topic: " + err.message);
+          setActiveTab("dashboard");
+        }
       }
-    } catch (err) {
-      console.error("Error selecting candidate", err);
-    } finally {
-      setCandidateSelectionLoading(false);
-    }
+    );
   };
 
   const handleRefineCurrentIdea = () => {
@@ -445,35 +443,59 @@ export default function App() {
   const sendAgentMessage = async (e) => {
     e.preventDefault();
     if (!chatInput.trim() || chatLoading) return;
-    
+
     const userMessage = chatInput;
     setChatInput("");
     setChatLoading(true);
-    
+
+    const agentDisplay = `${selectedAgentForChat.charAt(0).toUpperCase()}${selectedAgentForChat.slice(1)} Agent`;
     setChats(prev => [...prev, { sender: username, message: userMessage, created_at: new Date().toISOString() }]);
-    
+    setChats(prev => [...prev, { sender: agentDisplay, message: "", created_at: new Date().toISOString(), streaming: true }]);
+
+    const updateLastChat = (updater) => {
+      setChats(prev => {
+        const next = [...prev];
+        next[next.length - 1] = updater(next[next.length - 1]);
+        return next;
+      });
+    };
+
     try {
       const res = await fetch(`${API_BASE}/api/projects/${activeProject.id}/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          "Authorization": `Bearer ${token}`,
+          "Accept": "text/event-stream",
         },
         body: JSON.stringify({ message: userMessage, recipient: selectedAgentForChat })
       });
-      if (res.ok) {
-        const chatRes = await fetch(`${API_BASE}/api/projects/${activeProject.id}/chats`, {
-          headers: { "Authorization": `Bearer ${token}` }
-        });
-        if (chatRes.ok) {
-          const chatData = await chatRes.json();
-          setChats(chatData);
+      if (!res.ok || !res.body) throw new Error("Failed to reach agent uplink.");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop();
+        for (const frame of frames) {
+          const parsed = parseSSEChunk(frame);
+          if (!parsed) continue;
+          const { event, data } = parsed;
+          if (event === "token") {
+            updateLastChat(prev => ({ ...prev, message: (prev.message || "") + data.text }));
+          } else if (event === "agent_done") {
+            updateLastChat(prev => ({ ...prev, message: data.message, streaming: false }));
+          } else if (event === "error") {
+            updateLastChat(prev => ({ ...prev, message: `[ERROR] ${data.message}`, streaming: false }));
+          }
         }
-      } else {
-        alert("Failed to reach agent uplink.");
       }
     } catch (err) {
-      console.error("Error communicating with agent", err);
+      updateLastChat(prev => ({ ...prev, message: `[ERROR] ${err.message}`, streaming: false }));
     } finally {
       setChatLoading(false);
     }
@@ -665,33 +687,160 @@ export default function App() {
     setConsoleLogs(prev => [...prev, { text, color }]);
   };
 
-  const runMockLogs = (callback) => {
-    const steps = [
-      { agent: "SYSTEM", avatar: "memory", color: "text-slate-400 border-slate-500/20 bg-slate-500/10", text: "Initiating A2A Neural Protocol & Judge Panel..." },
-      { agent: "Innovation Agent", avatar: "tips_and_updates", color: "text-amber-400 border-amber-500/30 bg-amber-500/10", text: "Scanning concept for novelty & unique selling proposition..." },
-      { agent: "Feasibility Agent", avatar: "construction", color: "text-purple-400 border-purple-500/30 bg-purple-500/10", text: "Evaluating hackathon timeline constraints & scope limits..." },
-      { agent: "Impact Agent", avatar: "stars", color: "text-blue-400 border-blue-500/30 bg-blue-500/10", text: "Assessing user pain point, market adoption & demo WOW-factor..." },
-      { agent: "Technical Agent", avatar: "developer_board", color: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10", text: "Reviewing architecture: API integration, NLP libraries, database schema..." },
-      { agent: "Skeptic Agent", avatar: "security_update_warning", color: "text-rose-400 border-rose-500/30 bg-rose-500/10", text: "Skeptic challenge: Building full NLP in 24 hours has high integration risk!" },
-      { agent: "Technical Agent", avatar: "developer_board", color: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10", text: "Rebuttal: We can use pre-trained BERT/Rasa models to eliminate custom NLP training." },
-      { agent: "Feasibility Agent", avatar: "construction", color: "text-purple-400 border-purple-500/30 bg-purple-500/10", text: "Agreed! Pre-trained libraries reduce effort from 20 hours to 4 hours." },
-      { agent: "Innovation Agent", avatar: "tips_and_updates", color: "text-amber-400 border-amber-500/30 bg-amber-500/10", text: "Reflected score: Score revised up to 8/10 based on pre-trained API strategy." },
-      { agent: "Moderator Agent", avatar: "gavel", color: "text-cyan-400 border-cyan-500/30 bg-cyan-500/10", text: "Consensus reached: Scope down, utilize Rasa/BERT, prioritize 3-minute demo flow." }
-    ];
+  const AGENT_STYLE = {
+    innovation: { avatar: "tips_and_updates", color: "text-amber-400 border-amber-500/30 bg-amber-500/10" },
+    feasibility: { avatar: "construction", color: "text-purple-400 border-purple-500/30 bg-purple-500/10" },
+    impact: { avatar: "stars", color: "text-blue-400 border-blue-500/30 bg-blue-500/10" },
+    technical: { avatar: "developer_board", color: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10" },
+    skeptic: { avatar: "security_update_warning", color: "text-rose-400 border-rose-500/30 bg-rose-500/10" },
+    moderator: { avatar: "gavel", color: "text-cyan-400 border-cyan-500/30 bg-cyan-500/10" },
+  };
 
-    setConsoleLogs([{ agent: "SYSTEM", avatar: "memory", color: "text-slate-400", text: "Initializing node thread..." }]);
-    let index = 0;
+  const addAgentLog = (agent, text, style = AGENT_STYLE.moderator) => {
+    setConsoleLogs(prev => [...prev, {
+      agent,
+      avatar: style.avatar,
+      color: style.color,
+      text,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    }]);
+  };
 
-    function printNext() {
-      if (index < steps.length) {
-        setConsoleLogs(prev => [...prev, { ...steps[index], timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }]);
-        setTimeout(printNext, steps[index].delay || 800);
-        index++;
-      } else {
-        if (callback) callback();
-      }
+  const agentDisplayName = (key) => `${key.charAt(0).toUpperCase()}${key.slice(1)} Agent`;
+
+  const parseSSEChunk = (frame) => {
+    let event = "message";
+    const dataLines = [];
+    for (const line of frame.split("\n")) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
     }
-    printNext();
+    const dataStr = dataLines.join("\n");
+    if (!dataStr) return null;
+    let data;
+    try { data = JSON.parse(dataStr); } catch { return null; }
+    return { event, data };
+  };
+
+  const streamPipeline = async (url, payload, { onEvent, onError } = {}) => {
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+          "Accept": "text/event-stream",
+        },
+        body: JSON.stringify(payload)
+      });
+    } catch (err) {
+      if (onError) onError(err);
+      return;
+    }
+    if (!res.ok) {
+      const text = await res.text();
+      if (onError) onError(new Error(`Server error ${res.status}: ${text}`));
+      return;
+    }
+    if (!res.body) {
+      if (onError) onError(new Error("Streaming not supported by the browser"));
+      return;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop();
+        for (const frame of frames) {
+          const parsed = parseSSEChunk(frame);
+          if (parsed && onEvent) onEvent(parsed.event, parsed.data);
+        }
+      }
+    } catch (err) {
+      if (onError) onError(err);
+    }
+  };
+
+  const handlePipelineEvent = (event, data) => {
+    if (event === "phase_start") {
+      appendConsoleLine(`>>> ${data.title || data.phase}`, "#7dd3fc");
+      return;
+    }
+    if (event === "agent_done") {
+      const phase = data.phase || "";
+      const agent = data.agent || "agent";
+      const style = AGENT_STYLE[agent] || AGENT_STYLE.moderator;
+      const display = agentDisplayName(agent);
+
+      if (phase === "debate") {
+        const replies = extractDebateReplies(data.data);
+        if (replies.length === 0) {
+          addAgentLog(display, "Debate round complete — no direct challenges raised.", style);
+        }
+        replies.forEach(r => {
+          const stance = (r.stance || "").toLowerCase().includes("disagree")
+            ? "DISAGREES with"
+            : "responds to";
+          addAgentLog(display, `${stance} ${r.reply_to}: ${r.argument}`, style);
+        });
+        return;
+      }
+
+      if (phase === "review" || phase === "reflection") {
+        const d = data.data || {};
+        const score = d.score !== undefined ? d.score : (d.new_score !== undefined ? d.new_score : null);
+        const strengths = Array.isArray(d.strengths) ? d.strengths : (Array.isArray(d.pros) ? d.pros : []);
+        const label = phase === "review" ? "Independent review complete" : "Reflection complete";
+        const scoreTxt = score !== null ? ` | Score ${score}/10` : "";
+        addAgentLog(display, `${label}${scoreTxt}${strengths[0] ? " — " + strengths[0] : ""}`, style);
+        return;
+      }
+
+      if (phase === "proposal") {
+        const d = data.data || {};
+        const title = d.title || d.idea || "";
+        const fit = d.hackathon_fit !== undefined ? ` (fit ${d.hackathon_fit}/10)` : "";
+        addAgentLog(display, `Proposed idea: ${title}${fit}`, style);
+        return;
+      }
+
+      if (phase === "moderator") {
+        const d = data.data || {};
+        const consensus = Array.isArray(d.consensus)
+          ? d.consensus.join("; ")
+          : (d.synthesized_consensus || d.refined_idea || "");
+        addAgentLog(display, `Moderator synthesis complete — ${consensus || "consensus reached."}`, style);
+        return;
+      }
+
+      if (phase === "research") {
+        addAgentLog(display, "Web research complete.", style);
+        return;
+      }
+
+      addAgentLog(display, `${phase} phase complete.`, style);
+      return;
+    }
+    if (event === "complete") {
+      stopProgressTimer();
+      loadProjects();
+      if (data.version != null) {
+        setActiveVersionIdx(data.version - 1);
+      }
+      loadProjectDetails(data.project_id);
+      return;
+    }
+    if (event === "error") {
+      stopProgressTimer();
+      appendConsoleLine(`[ERROR] ${data.message}`, "#ffb4ab");
+      return;
+    }
   };
 
   const startProgressTimer = () => {
@@ -707,41 +856,6 @@ export default function App() {
     clearInterval(progressTimerRef.current);
   };
 
-  const readStreamResponse = async (response, onLog, onResult, onError) => {
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop(); // keep partial line in buffer
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith("data: ")) {
-            try {
-              const data = JSON.parse(trimmed.slice(6));
-              if (data.type === "log") {
-                onLog(data);
-              } else if (data.type === "result") {
-                onResult(data);
-              } else if (data.type === "error") {
-                onError(data.detail || "Server error in stream");
-              }
-            } catch (err) {
-              console.error("Failed to parse stream line:", trimmed, err);
-            }
-          }
-        }
-      }
-    } catch (err) {
-      console.error("Stream reader error:", err);
-      onError(err.message);
-    }
-  };
-
   const submitRefine = async (e) => {
     e.preventDefault();
     if (!projectName.trim()) {
@@ -751,11 +865,8 @@ export default function App() {
 
     setActiveTab("running");
     startProgressTimer();
-    setConsoleLogs([{
-      agent: "SYSTEM",
-      text: "Establishing secure connection to neural pathway...",
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-    }]);
+    setConsoleLogs([]);
+    appendConsoleLine("Initiating A2A Neural Protocol & Judge Panel...", "#7dd3fc");
 
     const payload = {
       project_name: projectName,
@@ -765,56 +876,15 @@ export default function App() {
       time_hours: refineTime ? parseInt(refineTime) : null
     };
 
-    try {
-      const res = await fetch(`${API_BASE}/idea/refine`, {
-        method: "POST",
-        headers: { 
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}` 
-        },
-        body: JSON.stringify(payload)
-      });
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Server error ${res.status}: ${text}`);
+    await streamPipeline(`${API_BASE}/idea/refine`, payload, {
+      onEvent: handlePipelineEvent,
+      onError: (err) => {
+        stopProgressTimer();
+        appendConsoleLine(`[ERROR] Refinement pipeline execution failed: ${err.message}`, "#ffb4ab");
+        alert("Execution failed: " + err.message);
+        setActiveTab("refine_form");
       }
-
-      let resultData = null;
-      await readStreamResponse(
-        res,
-        (log) => {
-          setConsoleLogs(prev => [...prev, {
-            agent: log.agent || "SYSTEM",
-            text: log.text,
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-          }]);
-        },
-        (result) => {
-          resultData = result;
-        },
-        (errorMsg) => {
-          throw new Error(errorMsg);
-        }
-      );
-
-      stopProgressTimer();
-      if (!resultData) {
-        throw new Error("No result metadata returned from stream.");
-      }
-
-      loadProjects();
-      loadProjectDetails(resultData.project_id);
-    } catch (err) {
-      stopProgressTimer();
-      setConsoleLogs(prev => [...prev, {
-        agent: "SYSTEM",
-        text: `[ERROR] Refinement pipeline execution failed: ${err.message}`,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      }]);
-      alert("Execution failed: " + err.message);
-      setActiveTab("refine_form");
-    }
+    });
   };
 
   const submitGenerate = async (e) => {
@@ -826,11 +896,8 @@ export default function App() {
 
     setActiveTab("running");
     startProgressTimer();
-    setConsoleLogs([{
-      agent: "SYSTEM",
-      text: "Establishing secure connection to neural pathway...",
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-    }]);
+    setConsoleLogs([]);
+    appendConsoleLine("Initiating A2A Neural Protocol & Judge Panel...", "#7dd3fc");
 
     const urls = genUrls ? genUrls.split(/\s+/).filter(u => u.trim()) : null;
     const payload = {
@@ -844,56 +911,15 @@ export default function App() {
       urls
     };
 
-    try {
-      const res = await fetch(`${API_BASE}/idea/generate`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
-        },
-        body: JSON.stringify(payload)
-      });
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Server error ${res.status}: ${text}`);
+    await streamPipeline(`${API_BASE}/idea/generate`, payload, {
+      onEvent: handlePipelineEvent,
+      onError: (err) => {
+        stopProgressTimer();
+        appendConsoleLine(`[ERROR] Generation pipeline execution failed: ${err.message}`, "#ffb4ab");
+        alert("Execution failed: " + err.message);
+        setActiveTab("generate_form");
       }
-
-      let resultData = null;
-      await readStreamResponse(
-        res,
-        (log) => {
-          setConsoleLogs(prev => [...prev, {
-            agent: log.agent || "SYSTEM",
-            text: log.text,
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-          }]);
-        },
-        (result) => {
-          resultData = result;
-        },
-        (errorMsg) => {
-          throw new Error(errorMsg);
-        }
-      );
-
-      stopProgressTimer();
-      if (!resultData) {
-        throw new Error("No result metadata returned from stream.");
-      }
-
-      loadProjects();
-      loadProjectDetails(resultData.project_id);
-    } catch (err) {
-      stopProgressTimer();
-      setConsoleLogs(prev => [...prev, {
-        agent: "SYSTEM",
-        text: `[ERROR] Generation pipeline execution failed: ${err.message}`,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      }]);
-      alert("Execution failed: " + err.message);
-      setActiveTab("generate_form");
-    }
+    });
   };
 
   const triggerIteration = async () => {
@@ -918,11 +944,8 @@ export default function App() {
 
     setActiveTab("running");
     startProgressTimer();
-    setConsoleLogs([{
-      agent: "SYSTEM",
-      text: "Establishing secure connection to neural pathway...",
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-    }]);
+    setConsoleLogs([]);
+    appendConsoleLine("Initiating A2A Neural Protocol & Judge Panel...", "#7dd3fc");
 
     const payload = {
       project_name: activeProject.name,
@@ -933,58 +956,15 @@ export default function App() {
       project_id: activeProject.id
     };
 
-    try {
-      const res = await fetch(`${API_BASE}/idea/refine`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
-        },
-        body: JSON.stringify(payload)
-      });
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Server error ${res.status}: ${text}`);
+    await streamPipeline(`${API_BASE}/idea/refine`, payload, {
+      onEvent: handlePipelineEvent,
+      onError: (err) => {
+        stopProgressTimer();
+        appendConsoleLine(`[ERROR] Iteration failed: ${err.message}`, "#ffb4ab");
+        alert("Iteration failed: " + err.message);
+        setActiveTab("dashboard");
       }
-
-      let resultData = null;
-      await readStreamResponse(
-        res,
-        (log) => {
-          setConsoleLogs(prev => [...prev, {
-            agent: log.agent || "SYSTEM",
-            text: log.text,
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-          }]);
-        },
-        (result) => {
-          resultData = result;
-        },
-        (errorMsg) => {
-          throw new Error(errorMsg);
-        }
-      );
-
-      stopProgressTimer();
-      if (!resultData) {
-        throw new Error("No result metadata returned from stream.");
-      }
-
-      // Reload the SAME project; point at the newest version (iterations stack, no new project).
-      setActiveVersionIdx((resultData.version != null ? resultData.version : 1) - 1);
-      loadProjects();
-      loadProjectDetails(activeProject.id);
-    } catch (err) {
-      stopProgressTimer();
-      setConsoleLogs(prev => [...prev, {
-        agent: "SYSTEM",
-        text: `[ERROR] Iteration failed: ${err.message}`,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      }]);
-      alert("Iteration failed: " + err.message);
-      setActiveTab("dashboard");
-    }
+    });
   };
 
   const openAgentModal = (name) => {
@@ -2566,7 +2546,7 @@ export default function App() {
                               <div className="text-slate-500 dark:text-on-surface-variant text-center py-xl">No operator follow-up logs recorded. Send a message to initiate debate.</div>
                             )}
                             
-                            {chatLoading && (
+                            {chatLoading && !chats.some(c => c.streaming) && (
                               <div className="flex flex-col items-start">
                                 <div className="bg-white dark:bg-[#131313] text-slate-500 rounded-lg p-sm border border-slate-200 dark:border-white/5 animate-pulse font-code-sm">
                                   {selectedAgentForChat.toUpperCase()} Agent is running inference response...

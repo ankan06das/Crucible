@@ -32,36 +32,46 @@ except ModuleNotFoundError:
     GenerationRequest = None
     GenerationResult = None
 
-import io
 import asyncio
-import contextlib
 from fastapi.responses import StreamingResponse
 
-class QueueWriter(io.StringIO):
-    def __init__(self, queue: asyncio.Queue, original_stdout):
-        super().__init__()
-        self.queue = queue
-        self.original_stdout = original_stdout
+# --- Server-Sent Events helpers ------------------------------------------------
 
-    def write(self, s: str):
-        self.original_stdout.write(s)
-        self.original_stdout.flush()
-        if s.strip():
-            try:
-                loop = asyncio.get_running_loop()
-                loop.call_soon_threadsafe(self.queue.put_nowait, s.strip())
-            except RuntimeError:
-                pass
+def _sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
 
-@contextlib.contextmanager
-def redirect_stdout_to_queue(queue: asyncio.Queue):
-    original_stdout = sys.stdout
-    writer = QueueWriter(queue, original_stdout)
-    sys.stdout = writer
+
+async def _pipeline_wrapper(coro_factory, queue: asyncio.Queue) -> None:
+    """Run a pipeline coroutine in the background, forwarding its events to `queue`.
+
+    A `None` sentinel in the queue signals the stream is finished.
+    """
     try:
-        yield
+        await coro_factory(queue)
+    except Exception as exc:
+        try:
+            await queue.put({"type": "error", "message": str(exc)})
+        except Exception:
+            pass
+        return
     finally:
-        sys.stdout = original_stdout
+        await queue.put(None)
+
+
+async def _run_pipeline_stream(coro_factory, queue: asyncio.Queue):
+    """Async generator that emits SSE frames for a background pipeline.
+
+    Cancels the pipeline task if the client disconnects.
+    """
+    task = asyncio.create_task(_pipeline_wrapper(coro_factory, queue))
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield _sse_event(item.get("type", "message"), item)
+    finally:
+        task.cancel()
 
 DB_FILE = Path(__file__).parent / "crucible.db"
 
@@ -453,83 +463,62 @@ async def handle_generate(req: GenReqWithProject, request: Request, authorizatio
         urls=req.urls,
     )
 
-    async def sse_generator():
-        queue = asyncio.Queue()
-        async def run_pipeline_task():
-            with redirect_stdout_to_queue(queue):
-                result = await generate_candidates(request.app, gen_req)
-            return result
+    async def _generate(q: asyncio.Queue):
+        async def emit(item):
+            await q.put(item)
 
-        task = asyncio.create_task(run_pipeline_task())
-        while not task.done() or not queue.empty():
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=0.1)
-                if isinstance(item, Exception):
-                    yield f"data: {json.dumps({'type': 'log', 'text': f'[ERROR] {str(item)}', 'agent': 'SYSTEM'})}\n\n"
-                    break
-                agent = "SYSTEM"
-                text = item
-                for possible_agent in ["Innovation", "Feasibility", "Impact", "Technical", "Skeptic", "Moderator", "Ideator", "Researcher", "Strategist"]:
-                    if possible_agent.lower() in item.lower():
-                        agent = f"{possible_agent} Agent"
-                        break
-                yield f"data: {json.dumps({'type': 'log', 'text': text, 'agent': agent})}\n\n"
-                queue.task_done()
-            except asyncio.TimeoutError:
-                continue
+        result = await generate_candidates(request.app, gen_req, emit=emit)
 
-        try:
-            result = await task
-            # Save to SQLite Projects
-            project_id = str(uuid.uuid4())
-            created_at = datetime.datetime.utcnow().isoformat()
-            
-            project_data = {
-                "status": "pending_selection",
-                "candidates": result.get("candidates", []),
-                "research": result.get("research", None),
-                "proposals": result.get("proposals", {}),
-                "debates": result.get("debates", {}),
-                "context": result.get("context", "")
-            }
-            project_data_json = json.dumps(project_data, default=str)
+        project_id = str(uuid.uuid4())
+        created_at = datetime.datetime.utcnow().isoformat()
 
-            conn = sqlite3.connect(str(DB_FILE))
-            c = conn.cursor()
-            c.execute(
-                "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (?, ?, ?, ?, ?)",
-                (project_id, resolved_user_id, req.project_name, created_at, project_data_json),
-            )
+        project_data = {
+            "status": "pending_selection",
+            "candidates": result.get("candidates", []),
+            "research": result.get("research", None),
+            "proposals": result.get("proposals", {}),
+            "debates": result.get("debates", {}),
+            "context": result.get("context", "")
+        }
+        project_data_json = json.dumps(project_data, default=str)
 
-            for agent, round_data in result.get("debates", {}).items():
-                if round_data and "root" in round_data:
-                    for reply in round_data["root"]:
-                        msg_id = str(uuid.uuid4())
-                        stance_val = reply.get("stance", "neutral")
-                        if isinstance(stance_val, dict) and "value" in stance_val:
-                            stance_val = stance_val["value"]
-                        elif hasattr(stance_val, "value"):
-                            stance_val = stance_val.value
-                        message_text = f"Debated {reply.get('reply_to', '')} ({stance_val}): {reply.get('argument', '')}"
-                        c.execute(
-                            "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
-                            (msg_id, project_id, agent, message_text, created_at),
-                        )
-            conn.commit()
-            conn.close()
+        conn = sqlite3.connect(str(DB_FILE))
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (?, ?, ?, ?, ?)",
+            (project_id, resolved_user_id, req.project_name, created_at, project_data_json),
+        )
 
-            final_res = {
-                "type": "result",
-                "project_id": project_id,
-                "project_name": req.project_name,
-                "status": "pending_selection",
-                "candidates": result.get("candidates", []),
-            }
-            yield f"data: {json.dumps(final_res)}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
+        for agent, round_data in result.get("debates", {}).items():
+            if round_data and "root" in round_data:
+                for reply in round_data["root"]:
+                    msg_id = str(uuid.uuid4())
+                    stance_val = reply.get("stance", "neutral")
+                    if isinstance(stance_val, dict) and "value" in stance_val:
+                        stance_val = stance_val["value"]
+                    elif hasattr(stance_val, "value"):
+                        stance_val = stance_val.value
+                    message_text = f"Debated {reply.get('reply_to', '')} ({stance_val}): {reply.get('argument', '')}"
+                    c.execute(
+                        "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (msg_id, project_id, agent, message_text, created_at),
+                    )
+        conn.commit()
+        conn.close()
 
-    return StreamingResponse(sse_generator(), media_type="text/event-stream")
+        await emit({
+            "type": "complete",
+            "project_id": project_id,
+            "project_name": req.project_name,
+            "status": "pending_selection",
+            "candidates": result.get("candidates", []),
+        })
+
+    return StreamingResponse(
+        _run_pipeline_stream(_generate, asyncio.Queue()),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 class SelectCandidateRequest(BaseModel):
@@ -558,52 +547,55 @@ async def select_candidate(project_id: str, req: SelectCandidateRequest, request
         
     project_data = json.loads(row[0]) if row[0] else {}
     project_name = row[1]
-    
-    # Run the refinement pipeline on the selected candidate idea
-    context = project_data.get("context", "")
-    result = await run_pipeline(request.app, req.idea, idea_context=context)
-    
-    # Save the refinement reviews and debate
-    res_dict = {
-        "reviews": {k: v.model_dump() for k, v in result.reviews.items()},
-        "debate": {k: v.model_dump() for k, v in result.debate.items()},
-        "reflections": {k: v.model_dump() for k, v in result.reflections.items()},
-        "moderator": result.moderator.model_dump() if result.moderator else None,
-        "research": {k: v.model_dump() for k, v in result.research.items()},
-    }
-    
-    # Update project data status to active
-    project_data["status"] = "active"
-    project_data["selected_candidate"] = {"title": req.title, "idea": req.idea}
-    project_data["refinement"] = res_dict
-    
-    project_data_json = json.dumps(project_data, default=str)
-    
-    c.execute(
-        "UPDATE projects SET project_data = ? WHERE id = ?",
-        (project_data_json, project_id)
-    )
-    
-    # Extract debates and save to chats table
-    created_at = datetime.datetime.utcnow().isoformat()
-    for agent, round_data in result.debate.items():
-        if round_data and round_data.root:
-            for reply in round_data.root:
-                msg_id = str(uuid.uuid4())
-                message_text = f"Debated {reply.reply_to} ({reply.stance.value}): {reply.argument}"
-                c.execute(
-                    "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (msg_id, project_id, agent, message_text, created_at),
-                )
-                
-    conn.commit()
     conn.close()
-    
-    return {
-        "project_id": project_id,
-        "name": project_name,
-        "project_data": project_data
-    }
+
+    context = project_data.get("context", "")
+
+    async def _select(q: asyncio.Queue):
+        async def emit(item):
+            await q.put(item)
+
+        result = await run_pipeline(request.app, req.idea, idea_context=context, emit=emit)
+
+        res_dict = {
+            "reviews": {k: v.model_dump() for k, v in result.reviews.items()},
+            "debate": {k: v.model_dump() for k, v in result.debate.items()},
+            "reflections": {k: v.model_dump() for k, v in result.reflections.items()},
+            "moderator": result.moderator.model_dump() if result.moderator else None,
+            "research": {k: v.model_dump() for k, v in result.research.items()},
+        }
+
+        conn = sqlite3.connect(str(DB_FILE))
+        c = conn.cursor()
+        project_data["status"] = "active"
+        project_data["selected_candidate"] = {"title": req.title, "idea": req.idea}
+        project_data["refinement"] = res_dict
+        project_data_json = json.dumps(project_data, default=str)
+        c.execute(
+            "UPDATE projects SET project_data = ? WHERE id = ?",
+            (project_data_json, project_id)
+        )
+
+        created_at = datetime.datetime.utcnow().isoformat()
+        for agent, round_data in result.debate.items():
+            if round_data and round_data.root:
+                for reply in round_data.root:
+                    msg_id = str(uuid.uuid4())
+                    message_text = f"Debated {reply.reply_to} ({reply.stance.value}): {reply.argument}"
+                    c.execute(
+                        "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (msg_id, project_id, agent, message_text, created_at),
+                    )
+        conn.commit()
+        conn.close()
+
+        await emit({"type": "complete", "project_id": project_id, "project_name": project_name})
+
+    return StreamingResponse(
+        _run_pipeline_stream(_select, asyncio.Queue()),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/idea/refine")
@@ -619,140 +611,118 @@ async def handle_refine(req: RefReqWithProject, request: Request, authorization:
         context_parts.append(f"Time available: {req.time_hours} hours")
     idea_context = "\n".join(context_parts) if context_parts else None
 
-    async def sse_generator():
-        queue = asyncio.Queue()
-        async def run_pipeline_task():
-            with redirect_stdout_to_queue(queue):
-                result = await run_pipeline(request.app, req.idea, idea_context=idea_context)
-            return result
+    async def _refine(q: asyncio.Queue):
+        async def emit(item):
+            await q.put(item)
 
-        task = asyncio.create_task(run_pipeline_task())
-        while not task.done() or not queue.empty():
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=0.1)
-                if isinstance(item, Exception):
-                    yield f"data: {json.dumps({'type': 'log', 'text': f'[ERROR] {str(item)}', 'agent': 'SYSTEM'})}\n\n"
-                    break
-                agent = "SYSTEM"
-                text = item
-                for possible_agent in ["Innovation", "Feasibility", "Impact", "Technical", "Skeptic", "Moderator", "Ideator", "Researcher", "Strategist"]:
-                    if possible_agent.lower() in item.lower():
-                        agent = f"{possible_agent} Agent"
-                        break
-                yield f"data: {json.dumps({'type': 'log', 'text': text, 'agent': agent})}\n\n"
-                queue.task_done()
-            except asyncio.TimeoutError:
-                continue
+        result = await run_pipeline(request.app, req.idea, idea_context=idea_context, emit=emit)
+        created_at = datetime.datetime.utcnow().isoformat()
 
-        try:
-            result = await task
-            created_at = datetime.datetime.utcnow().isoformat()
-            
-            res_dict = {
-                "idea": req.idea,
-                "reviews": {k: v.model_dump() for k, v in result.reviews.items()},
-                "debate": {k: v.model_dump() for k, v in result.debate.items()},
-                "reflections": {k: v.model_dump() for k, v in result.reflections.items()},
-                "moderator": result.moderator.model_dump() if result.moderator else None,
-                "research": {k: v.model_dump() for k, v in result.research.items()},
-            }
+        res_dict = {
+            "idea": req.idea,
+            "reviews": {k: v.model_dump() for k, v in result.reviews.items()},
+            "debate": {k: v.model_dump() for k, v in result.debate.items()},
+            "reflections": {k: v.model_dump() for k, v in result.reflections.items()},
+            "moderator": result.moderator.model_dump() if result.moderator else None,
+            "research": {k: v.model_dump() for k, v in result.research.items()},
+        }
 
-            project_id = req.project_id or str(uuid.uuid4())
-            project_data = {}
+        project_id = req.project_id or str(uuid.uuid4())
+        project_data = {}
 
-            conn = sqlite3.connect(str(DB_FILE))
-            c = conn.cursor()
+        conn = sqlite3.connect(str(DB_FILE))
+        c = conn.cursor()
 
-            # When iterating an existing idea (project_id provided), append a new
-            # version to the SAME project instead of creating a brand-new one.
-            if req.project_id:
-                c.execute(
-                    "SELECT project_data, name FROM projects WHERE id = ? AND user_id = ?",
-                    (req.project_id, resolved_user_id),
-                )
-                row = c.fetchone()
-                if not row:
-                    conn.close()
-                    raise HTTPException(status_code=404, detail="Project not found or access denied")
-                project_data = json.loads(row[0]) if row[0] else {}
-                if not req.project_name:
-                    req.project_name = row[1]
+        # When iterating an existing idea (project_id provided), append a new
+        # version to the SAME project instead of creating a brand-new one.
+        if req.project_id:
+            c.execute(
+                "SELECT project_data, name FROM projects WHERE id = ? AND user_id = ?",
+                (req.project_id, resolved_user_id),
+            )
+            row = c.fetchone()
+            if not row:
+                conn.close()
+                raise HTTPException(status_code=404, detail="Project not found or access denied")
+            project_data = json.loads(row[0]) if row[0] else {}
+            if not req.project_name:
+                req.project_name = row[1]
 
-            versions = project_data.get("versions")
-            if not isinstance(versions, list):
-                # Seed any legacy refinement as version 1 so iterations stack cleanly.
-                versions = []
-                legacy = project_data.get("refinement")
-                if isinstance(legacy, dict):
-                    versions.append({
-                        "version": 1,
-                        "created_at": project_data.get("created_at", created_at),
-                        "idea": legacy.get("idea", ""),
-                        "reviews": legacy.get("reviews", {}),
-                        "debate": legacy.get("debate", {}),
-                        "reflections": legacy.get("reflections", {}),
-                        "moderator": legacy.get("moderator", None),
-                        "research": legacy.get("research", {}),
-                    })
+        versions = project_data.get("versions")
+        if not isinstance(versions, list):
+            # Seed any legacy refinement as version 1 so iterations stack cleanly.
+            versions = []
+            legacy = project_data.get("refinement")
+            if isinstance(legacy, dict):
+                versions.append({
+                    "version": 1,
+                    "created_at": project_data.get("created_at", created_at),
+                    "idea": legacy.get("idea", ""),
+                    "reviews": legacy.get("reviews", {}),
+                    "debate": legacy.get("debate", {}),
+                    "reflections": legacy.get("reflections", {}),
+                    "moderator": legacy.get("moderator", None),
+                    "research": legacy.get("research", {}),
+                })
 
-            next_version = (versions[-1]["version"] + 1) if versions else 1
+        next_version = (versions[-1]["version"] + 1) if versions else 1
 
-            version_obj = {
-                "version": next_version,
-                "created_at": created_at,
-                "idea": req.idea,
-                "reviews": res_dict["reviews"],
-                "debate": res_dict["debate"],
-                "reflections": res_dict["reflections"],
-                "moderator": res_dict["moderator"],
-                "research": res_dict["research"],
-            }
-            versions.append(version_obj)
+        version_obj = {
+            "version": next_version,
+            "created_at": created_at,
+            "idea": req.idea,
+            "reviews": res_dict["reviews"],
+            "debate": res_dict["debate"],
+            "reflections": res_dict["reflections"],
+            "moderator": res_dict["moderator"],
+            "research": res_dict["research"],
+        }
+        versions.append(version_obj)
 
-            # Keep latest version mirrored under `refinement` for backward compat.
-            project_data["versions"] = versions
-            project_data["refinement"] = res_dict
-            project_data["created_at"] = created_at
+        # Keep latest version mirrored under `refinement` for backward compat.
+        project_data["versions"] = versions
+        project_data["refinement"] = res_dict
+        project_data["created_at"] = created_at
 
-            project_data_json = json.dumps(project_data, default=str)
+        project_data_json = json.dumps(project_data, default=str)
 
-            if req.project_id:
-                c.execute(
-                    "UPDATE projects SET project_data = ?, name = ? WHERE id = ?",
-                    (project_data_json, req.project_name, project_id),
-                )
-            else:
-                c.execute(
-                    "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (?, ?, ?, ?, ?)",
-                    (project_id, resolved_user_id, req.project_name, created_at, project_data_json),
-                )
+        if req.project_id:
+            c.execute(
+                "UPDATE projects SET project_data = ?, name = ? WHERE id = ?",
+                (project_data_json, req.project_name, project_id),
+            )
+        else:
+            c.execute(
+                "INSERT INTO projects (id, user_id, name, created_at, project_data) VALUES (?, ?, ?, ?, ?)",
+                (project_id, resolved_user_id, req.project_name, created_at, project_data_json),
+            )
 
-            for agent, round_data in result.debate.items():
-                if round_data and round_data.root:
-                    for reply in round_data.root:
-                        msg_id = str(uuid.uuid4())
-                        message_text = f"Debated {reply.reply_to} ({reply.stance.value}): {reply.argument}"
-                        c.execute(
-                            "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
-                            (msg_id, project_id, agent, message_text, created_at),
-                        )
+        for agent, round_data in result.debate.items():
+            if round_data and round_data.root:
+                for reply in round_data.root:
+                    msg_id = str(uuid.uuid4())
+                    message_text = f"Debated {reply.reply_to} ({reply.stance.value}): {reply.argument}"
+                    c.execute(
+                        "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (msg_id, project_id, agent, message_text, created_at),
+                    )
 
-            conn.commit()
-            conn.close()
+        conn.commit()
+        conn.close()
 
-            final_res = {
-                "type": "result",
-                "project_id": project_id,
-                "project_name": req.project_name,
-                "version": next_version,
-                "versions": [v["version"] for v in versions],
-                "result": res_dict,
-            }
-            yield f"data: {json.dumps(final_res)}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
+        await emit({
+            "type": "complete",
+            "project_id": project_id,
+            "project_name": req.project_name,
+            "version": next_version,
+            "versions": [v["version"] for v in versions],
+        })
 
-    return StreamingResponse(sse_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        _run_pipeline_stream(_refine, asyncio.Queue()),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 from llm import LLM
@@ -880,32 +850,52 @@ async def chat_with_agent(project_id: str, req: ChatAgentRequest, authorization:
         INSERT INTO chats (id, project_id, sender, message, created_at)
         VALUES (?, ?, ?, ?, ?)
     """, (user_msg_id, project_id, username, req.message, created_at))
-    
-    # 5. Format agent prompt and call LLM
-    prompt = get_agent_response_prompt(req.recipient, idea, project_data, chat_history, req.message)
-    
-    llm = LLM()
-    try:
-        agent_reply = await llm.generate(prompt)
-    except Exception as e:
-        conn.close()
-        raise HTTPException(status_code=500, detail=f"LLM generation failed: {str(e)}")
-        
-    # 6. Insert agent response in database
-    agent_msg_id = str(uuid.uuid4())
-    agent_display_name = f"{req.recipient.capitalize()} Agent"
-    c.execute("""
-        INSERT INTO chats (id, project_id, sender, message, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (agent_msg_id, project_id, agent_display_name, agent_reply, created_at))
-    
     conn.commit()
     conn.close()
-    
-    return {
-        "user_message": {"sender": username, "message": req.message, "created_at": created_at},
-        "agent_message": {"sender": agent_display_name, "message": agent_reply, "created_at": created_at}
-    }
+
+    # 5. Format agent prompt and stream the reply token-by-token
+    prompt = get_agent_response_prompt(req.recipient, idea, project_data, chat_history, req.message)
+    agent_display_name = f"{req.recipient.capitalize()} Agent"
+
+    async def event_source():
+        yield _sse_event("user_message", {
+            "sender": username,
+            "message": req.message,
+            "created_at": created_at,
+        })
+        llm = LLM()
+        chunks: list[str] = []
+        try:
+            async for chunk in llm.stream(prompt):
+                chunks.append(chunk)
+                yield _sse_event("token", {"text": chunk})
+        except Exception as e:
+            yield _sse_event("error", {"message": f"LLM generation failed: {str(e)}"})
+            return
+
+        # 6. Persist agent response once streaming completes
+        agent_reply = "".join(chunks)
+        conn = sqlite3.connect(str(DB_FILE))
+        c = conn.cursor()
+        agent_msg_id = str(uuid.uuid4())
+        c.execute("""
+            INSERT INTO chats (id, project_id, sender, message, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (agent_msg_id, project_id, agent_display_name, agent_reply, created_at))
+        conn.commit()
+        conn.close()
+
+        yield _sse_event("agent_done", {
+            "sender": agent_display_name,
+            "message": agent_reply,
+            "created_at": created_at,
+        })
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 

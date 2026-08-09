@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from a2a_router.client import A2APanelClient
 from a2a_router.server import mount
@@ -39,12 +39,24 @@ def _print_step(step: str, value: object) -> None:
     print(summarize(value))
 
 
+async def _emit_phase(
+    emit: Callable[[dict], Awaitable[None]] | None,
+    phase: str,
+    title: str | None = None,
+) -> None:
+    if emit:
+        await emit({"type": "phase_start", "phase": phase, "title": title or phase})
+
+
 async def _run_tasks(
     title: str,
     tasks: dict[str, asyncio.Task],
     show_results: bool = False,
+    emit: Callable[[dict], Awaitable[None]] | None = None,
+    phase: str | None = None,
 ) -> dict[str, object]:
     _print_phase(title)
+    phase = phase or title.lower().replace(" ", "_")
     name_by_task = {task: name for name, task in tasks.items()}
     done: dict[str, object] = {}
     async for completed in asyncio.as_completed(tasks.values()):
@@ -52,6 +64,11 @@ async def _run_tasks(
         value = await completed
         done[name] = value
         print(f"[{title}] {name} finished")
+        if emit:
+            data = value.model_dump() if hasattr(value, "model_dump") else value
+            await emit(
+                {"type": "agent_done", "phase": phase, "agent": name, "data": data}
+            )
         if show_results:
             _print_step(f"{title} - {name}", value)
     return done
@@ -105,31 +122,43 @@ def _unpack_proposals(proposals: dict[str, object]) -> list[CandidateProposal]:
 
 
 async def generate_candidates(
-    app: "FastAPI", req: GenerationRequest, llm: LLM | None = None
+    app: "FastAPI",
+    req: GenerationRequest,
+    llm: LLM | None = None,
+    emit: Callable[[dict], Awaitable[None]] | None = None,
 ) -> dict[str, object]:
     llm = llm or LLM()
     cards = mount(app, llm=llm)
     panel = A2APanelClient(app, cards)
     try:
         _print_phase("FACTUAL DATA COLLECTION")
+        await _emit_phase(emit, "research", "Web Research")
         brief = await research_topic(req.topic, req.urls, llm)
         _print_step("FACT SHEET", brief)
         fact_sheet = _format_fact_sheet(brief)
         context = _format_context(req)
 
         # Parallel independent generation (groupthink-free)
+        await _emit_phase(emit, "proposal", "Idea Proposals")
         proposal_tasks = {}
         for spec in GENERATOR_SPECS:
             skill, schema = GEN_SKILLS[spec.name]
             proposal_tasks[spec.name] = asyncio.create_task(
                 panel.ask(spec.name, f"{fact_sheet}\n\n{context}", skill, schema)
             )
-        proposals = await _run_tasks("IDEA PROPOSALS", proposal_tasks, show_results=True)
+        proposals = await _run_tasks(
+            "IDEA PROPOSALS",
+            proposal_tasks,
+            show_results=True,
+            emit=emit,
+            phase="proposal",
+        )
 
         candidates = _unpack_proposals(proposals)
         candidate_board = _format_candidates(candidates)
 
         # Generation debate: everyone argues over the pooled candidate board by title
+        await _emit_phase(emit, "debate", "Generation Debate")
         debate_tasks = {}
         for spec in GENERATOR_SPECS:
             prompt = (
@@ -141,7 +170,13 @@ async def generate_candidates(
             debate_tasks[spec.name] = asyncio.create_task(
                 panel.ask(spec.name, prompt, "debate", DebateRound)
             )
-        debates = await _run_tasks("GENERATION DEBATE", debate_tasks, show_results=True)
+        debates = await _run_tasks(
+            "GENERATION DEBATE",
+            debate_tasks,
+            show_results=True,
+            emit=emit,
+            phase="debate",
+        )
 
         # Return data to store in projects
         return {
@@ -156,31 +191,43 @@ async def generate_candidates(
 
 
 async def generate_idea(
-    app: "FastAPI", req: GenerationRequest, llm: LLM | None = None
+    app: "FastAPI",
+    req: GenerationRequest,
+    llm: LLM | None = None,
+    emit: Callable[[dict], Awaitable[None]] | None = None,
 ) -> GenerationResult:
     llm = llm or LLM()
     cards = mount(app, llm=llm)
     panel = A2APanelClient(app, cards)
     try:
         _print_phase("FACTUAL DATA COLLECTION")
+        await _emit_phase(emit, "research", "Web Research")
         brief = await research_topic(req.topic, req.urls, llm)
         _print_step("FACT SHEET", brief)
         fact_sheet = _format_fact_sheet(brief)
         context = _format_context(req)
 
         # Parallel independent generation (groupthink-free)
+        await _emit_phase(emit, "proposal", "Idea Proposals")
         proposal_tasks = {}
         for spec in GENERATOR_SPECS:
             skill, schema = GEN_SKILLS[spec.name]
             proposal_tasks[spec.name] = asyncio.create_task(
                 panel.ask(spec.name, f"{fact_sheet}\n\n{context}", skill, schema)
             )
-        proposals = await _run_tasks("IDEA PROPOSALS", proposal_tasks, show_results=True)
+        proposals = await _run_tasks(
+            "IDEA PROPOSALS",
+            proposal_tasks,
+            show_results=True,
+            emit=emit,
+            phase="proposal",
+        )
 
         candidates = _unpack_proposals(proposals)
         candidate_board = _format_candidates(candidates)
 
         # Generation debate: everyone argues over the pooled candidate board by title
+        await _emit_phase(emit, "debate", "Generation Debate")
         debate_tasks = {}
         for spec in GENERATOR_SPECS:
             prompt = (
@@ -192,7 +239,13 @@ async def generate_idea(
             debate_tasks[spec.name] = asyncio.create_task(
                 panel.ask(spec.name, prompt, "debate", DebateRound)
             )
-        debates = await _run_tasks("GENERATION DEBATE", debate_tasks, show_results=True)
+        debates = await _run_tasks(
+            "GENERATION DEBATE",
+            debate_tasks,
+            show_results=True,
+            emit=emit,
+            phase="debate",
+        )
 
         # Concluder picks the topic from the full pool
         _print_phase("GENERATION CONCLUSION")
@@ -218,6 +271,7 @@ async def generate_idea(
             app,
             conclusion.selected_idea,
             idea_context=context,
+            emit=emit,
         )
 
         shortlist = next(
