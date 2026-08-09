@@ -15,3 +15,6 @@ graphify-out/
 
 #log files
 generator_pipeline.log
+
+#outputs
+outputs
