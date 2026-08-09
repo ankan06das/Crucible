@@ -11,6 +11,7 @@ import TopNav from "./components/TopNav";
 import DesktopSidebar from "./components/DesktopSidebar";
 import MobileDrawer from "./components/MobileDrawer";
 import PathwayView from "./components/PathwayView";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import RefineFormView from "./components/RefineFormView";
 import GenerateFormView from "./components/GenerateFormView";
 import RunningView from "./components/RunningView";
@@ -27,7 +28,7 @@ import CollabModal from "./components/CollabModal";
 import DeleteConfirmModal from "./components/DeleteConfirmModal";
 import Notice from "./components/Notice";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 export default function App() {
   // Auth state
@@ -320,6 +321,30 @@ export default function App() {
       setInviteStatus("Failed to send invite: connection lost");
     }
   };
+  const chooseCandidateIdea = async (candidate) => {
+    if (!activeProject) return;
+    setCandidateSelectionLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/projects/${activeProject.id}/choose-candidate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ title: candidate.title || activeProject.name, idea: candidate.idea || activeProject.name })
+      });
+      if (res.ok) {
+        // Now reload project details
+        await loadProjectDetails(activeProject.id);
+      } else {
+        showNotice("error", "Failed to select candidate");
+      }
+    } catch (err) {
+      showNotice("error", "Network error while selecting candidate");
+    } finally {
+      setCandidateSelectionLoading(false);
+    }
+  };
 
   const selectCandidateIdea = async (candidate) => {
     if (!activeProject) return;
@@ -454,7 +479,6 @@ export default function App() {
     setProjectLoading(true);
     if (!isInitialLoad) {
       setActiveTab("dashboard");
-      setSelectedCandidateIdx(candidateIdx);
     }
     setSelectedImprovements({});
 
@@ -477,6 +501,11 @@ export default function App() {
         localStorage.setItem("crucible_activeProjectId", data.id);
         setLoadedResult(parsedData);
         if (!isInitialLoad) {
+          if (parsedData.status === "pending_selection") {
+            setSelectedCandidateIdx(null);
+          } else {
+            setSelectedCandidateIdx(candidateIdx);
+          }
           setActiveVersionIdx(Array.isArray(parsedData.versions) && parsedData.versions.length
             ? parsedData.versions.length - 1
             : 0);
@@ -834,6 +863,11 @@ export default function App() {
 
       if (phase === "proposal") {
         const d = data.data || {};
+        if (d.ideas && Array.isArray(d.ideas)) {
+          const titles = d.ideas.map(c => c.title || "Untitled").join(", ");
+          addAgentLog(display, `Proposed ${d.ideas.length} ideas: ${titles}`, style, { action: "Proposed shortlist" });
+          return;
+        }
         const title = d.title || d.idea || "";
         const fit = d.hackathon_fit !== undefined ? d.hackathon_fit : null;
         addAgentLog(display, title, style, { action: "Proposed idea", score: fit });
@@ -1281,6 +1315,7 @@ export default function App() {
     respondToInvitation,
     loadCollaborators,
     inviteCollaborator,
+    chooseCandidateIdea,
     selectCandidateIdea,
     handleRefineCurrentIdea,
     getActiveCandidateInfo,

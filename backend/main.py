@@ -26,6 +26,16 @@ from pydantic import BaseModel, field_validator, EmailStr
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 import re
+import bcrypt
+
+def verify_password(plain_password, hashed_password):
+    try:
+        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    except Exception:
+        return False
+
+def get_password_hash(password):
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 from contextlib import asynccontextmanager
 
@@ -279,9 +289,10 @@ async def register(req: RegisterRequest):
     c = conn.cursor()
     try:
         user_id = str(uuid.uuid4())
+        hashed_password = get_password_hash(req.password)
         await c.execute(
             "INSERT INTO users (id, username, password, email, provider) VALUES (%s, %s, %s, %s, 'local')",
-            (user_id, req.username, req.password, req.email),
+            (user_id, req.username, hashed_password, req.email),
         )
         await conn.commit()
         return {"id": user_id, "username": req.username, "email": req.email}
@@ -299,12 +310,13 @@ async def login(req: LoginRequest):
     conn = await get_conn()
     c = conn.cursor()
     await c.execute(
-        "SELECT id, email, provider FROM users WHERE username = %s AND password = %s",
-        (req.username, req.password),
+        "SELECT id, email, provider, password FROM users WHERE username = %s",
+        (req.username,),
     )
     row = await c.fetchone()
     await put_conn(conn)
-    if not row:
+    
+    if not row or not verify_password(req.password, row[3]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or passcode"
@@ -368,9 +380,10 @@ async def google_register(req: GoogleRegisterRequest):
     try:
         user_id = str(uuid.uuid4())
         password = str(uuid.uuid4())  # generate random password
+        hashed_password = get_password_hash(password)
         await c.execute(
             "INSERT INTO users (id, username, password, email, provider) VALUES (%s, %s, %s, %s, 'google')",
-            (user_id, req.username, password, email),
+            (user_id, req.username, hashed_password, email),
         )
         await conn.commit()
         return {
@@ -396,11 +409,13 @@ async def update_password(req: UpdatePasswordRequest, authorization: str = Heade
     c = conn.cursor()
     
     try:
-        await c.execute("SELECT id FROM users WHERE id = %s AND password = %s", (user_id, req.current_password))
-        if not await c.fetchone():
+        await c.execute("SELECT password FROM users WHERE id = %s", (user_id,))
+        row = await c.fetchone()
+        if not row or not verify_password(req.current_password, row[0]):
              raise HTTPException(status_code=400, detail="Incorrect current password")
              
-        await c.execute("UPDATE users SET password = %s WHERE id = %s", (req.new_password, user_id))
+        hashed_new_password = get_password_hash(req.new_password)
+        await c.execute("UPDATE users SET password = %s WHERE id = %s", (hashed_new_password, user_id))
         await conn.commit()
         return {"status": "success"}
     finally:
@@ -622,18 +637,27 @@ async def handle_generate(req: GenReqWithProject, request: Request, authorizatio
         async def emit(item):
             await q.put(item)
 
-        result = await generate_candidates(request.app, gen_req, emit=emit)
+        from generator import generate_idea
+        result = await generate_idea(request.app, gen_req, emit=emit)
 
         project_id = str(uuid.uuid4())
         created_at = datetime.datetime.utcnow().isoformat()
 
+        # result is a GenerationResult object
         project_data = {
-            "status": "pending_selection",
-            "candidates": result.get("candidates", []),
-            "research": result.get("research"),
-            "proposals": result.get("proposals", {}),
-            "debates": result.get("debates", {}),
-            "context": result.get("context", "")
+            "status": "active",
+            "candidates": [c.model_dump() for c in result.candidates] if result.candidates else [],
+            "selected_candidate": result.candidates[0].model_dump() if result.candidates else None,
+            "research": result.research.model_dump() if result.research else None,
+            "proposals": {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in result.proposals.items()} if result.proposals else {},
+            "debates": {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in result.debates.items()} if result.debates else {},
+            "refinement": {
+                "reviews": {k: v.model_dump() for k, v in result.refined_reviews.items()} if result.refined_reviews else {},
+                "debates": {k: v.model_dump() for k, v in result.refined_debates.items()} if result.refined_debates else {},
+                "reflections": {k: v.model_dump() for k, v in result.refined_reflections.items()} if result.refined_reflections else {},
+                "moderator": result.moderator.model_dump() if result.moderator else None
+            },
+            "context": result.conclusion.rationale if result.conclusion else ""
         }
         project_data_json = json.dumps(project_data, default=str)
 
@@ -665,7 +689,7 @@ async def handle_generate(req: GenReqWithProject, request: Request, authorizatio
             "type": "complete",
             "project_id": project_id,
             "project_name": req.project_name,
-            "status": "pending_selection",
+            "status": "active",
             "candidates": project_data["candidates"],
         })
 
@@ -679,6 +703,62 @@ async def handle_generate(req: GenReqWithProject, request: Request, authorizatio
 class SelectCandidateRequest(BaseModel):
     title: str
     idea: str
+
+
+@app.post("/api/projects/{project_id}/choose-candidate")
+async def choose_candidate(project_id: str, req: SelectCandidateRequest, authorization: str = Header(None)):
+    resolved_user_id = await get_user_id_from_header(authorization)
+    
+    conn = await get_conn()
+    c = conn.cursor()
+    
+    await c.execute("""
+        SELECT p.project_data
+        FROM projects p
+        LEFT JOIN project_collaborators pc ON p.id = pc.project_id
+        WHERE p.id = %s AND (p.user_id = %s OR pc.user_id = %s)
+    """, (project_id, resolved_user_id, resolved_user_id))
+    row = await c.fetchone()
+    if not row:
+        await put_conn(conn)
+        raise HTTPException(status_code=404, detail="Project not found or access denied")
+        
+    project_data = json.loads(row[0]) if row[0] else {}
+    project_data["status"] = "active"
+    
+    # Optional: Find the full original candidate object if needed, but we can just use title and idea.
+    selected_cand = {"title": req.title, "idea": req.idea}
+    for cand in project_data.get("candidates", []):
+        if cand.get("title") == req.title and cand.get("idea") == req.idea:
+            selected_cand = cand
+            break
+            
+    project_data["selected_candidate"] = selected_cand
+    project_data["candidates"] = [selected_cand]
+    
+    project_data_json = json.dumps(project_data, default=str)
+    await c.execute(
+        "UPDATE projects SET project_data = %s WHERE id = %s",
+        (project_data_json, project_id)
+    )
+    await conn.commit()
+    
+    # Refetch full project structure
+    await c.execute("""
+        SELECT p.id, p.name, p.created_at, p.project_data, p.user_id 
+        FROM projects p
+        WHERE p.id = %s
+    """, (project_id,))
+    updated_row = await c.fetchone()
+    await put_conn(conn)
+    
+    return {
+        "id": updated_row[0],
+        "name": updated_row[1],
+        "created_at": updated_row[2],
+        "project_data": json.loads(updated_row[3]),
+        "owner_id": updated_row[4],
+    }
 
 
 @app.post("/api/projects/{project_id}/select-candidate")
@@ -1013,10 +1093,17 @@ async def chat_with_agent(project_id: str, req: ChatAgentRequest, authorization:
     # 2. Extract idea
     idea = ""
     if "selected_candidate" in project_data:
-        idea = project_data["selected_candidate"].get("idea", "")
+        sel = project_data["selected_candidate"]
+        if isinstance(sel, str):
+            idea = sel
+            for cand in project_data.get("candidates", []):
+                if cand.get("title") == sel:
+                    idea = cand.get("idea", idea)
+                    break
+        else:
+            idea = sel.get("idea", "")
     else:
         idea = project_data.get("idea", "")
-        
     # 3. Load chat history
     await c.execute("""
         SELECT sender, message 

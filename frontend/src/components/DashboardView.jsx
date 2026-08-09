@@ -26,6 +26,7 @@ export default function DashboardView() {
     openModeratorChat,
     operatorNotes,
     projectLoading,
+    chooseCandidateIdea,
     selectCandidateIdea,
     selectedAgentForChat,
     selectedCandidateIdx,
@@ -71,14 +72,14 @@ export default function DashboardView() {
                 <Card key={idx} className="flex flex-col p-5">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-xs font-medium text-slate-400">Option {idx + 1}</span>
-                    <Badge tone="primary">{cand.creator || "Innovation Agent"}</Badge>
+                    <Badge tone="primary">{cand.creator || cand.agent || "AI Agent"}</Badge>
                   </div>
                   <h3 className="mt-2 font-semibold text-slate-900 dark:text-white">{cand.title}</h3>
                   <p className="mt-1 flex-1 text-sm leading-relaxed text-slate-500 line-clamp-5 dark:text-slate-400">{cand.idea}</p>
                   <div className="mt-4 flex flex-col gap-2">
-                    <Button onClick={() => selectCandidateIdea(cand)}>
-                      <span className="material-symbols-outlined text-base">rocket_launch</span>
-                      Run refinement
+                    <Button onClick={() => chooseCandidateIdea(cand)}>
+                      <span className="material-symbols-outlined text-base">check_circle</span>
+                      Choose Idea
                     </Button>
                     <Button variant="secondary" onClick={() => loadProjectDetails(activeProject.id, idx)}>
                       View concept page
