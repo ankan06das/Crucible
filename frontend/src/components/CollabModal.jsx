@@ -17,7 +17,7 @@ export default function CollabModal() {
         <div className="flex items-center justify-between border-b border-slate-200 p-4 dark:border-[#272c3d]">
           <h3 className="flex items-center gap-1.5 text-base font-semibold text-slate-900 dark:text-white">
             <span className="material-symbols-outlined text-lg">groups</span>
-            Share project
+            Share entire project folder
           </h3>
           <button onClick={() => setShowCollabModal(false)} className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-[#1a1e2b]">
             <span className="material-symbols-outlined">close</span>
@@ -25,7 +25,7 @@ export default function CollabModal() {
         </div>
         <div className="flex-1 space-y-4 overflow-y-auto p-5">
           <form onSubmit={inviteCollaborator} className="space-y-2">
-            <Field label="Invite a teammate (email / username)">
+            <Field label="Invite a teammate to this entire folder (email / username)">
               <div className="flex gap-2">
                 <input
                   className={inputCls}

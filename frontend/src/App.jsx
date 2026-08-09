@@ -42,7 +42,7 @@ export default function App() {
   const [googleCredential, setGoogleCredential] = useState(null);
 
   // App views state
-  const [activeTab, setActiveTab] = useState("pathway"); // pathway, refine_form, generate_form, running, dashboard, analytics, config, logs, status, profile, about, contact
+  const [activeTab, setActiveTab] = useState(localStorage.getItem("crucible_activeTab") || "pathway"); // pathway, refine_form, generate_form, running, dashboard, analytics, config, logs, status, profile, about, contact
   const [projects, setProjects] = useState([]);
   const [activeProject, setActiveProject] = useState(null);
   const [chats, setChats] = useState([]);
@@ -50,7 +50,7 @@ export default function App() {
   const [progressTime, setProgressTime] = useState(0.0);
   const [deleteConfirmProject, setDeleteConfirmProject] = useState(null);
   const [loadedResult, setLoadedResult] = useState(null);
-  const [projectLoading, setProjectLoading] = useState(false);
+  const [projectLoading, setProjectLoading] = useState(!!localStorage.getItem("crucible_activeProjectId"));
 
   // Form states
   const [projectName, setProjectName] = useState("");
@@ -103,11 +103,18 @@ export default function App() {
   const [chatLoading, setChatLoading] = useState(false);
   const [showCollabModal, setShowCollabModal] = useState(false);
   const [candidateSelectionLoading, setCandidateSelectionLoading] = useState(false);
-  const [activeTabSubView, setActiveTabSubView] = useState("overview"); // overview | reviews | debates | chat | candidates
-  const [activeDebateStage, setActiveDebateStage] = useState("reviews");
-  const [selectedCandidateIdx, setSelectedCandidateIdx] = useState(0);
+  const [activeTabSubView, setActiveTabSubView] = useState(localStorage.getItem("crucible_activeTabSubView") || "overview"); // overview | reviews | debates | chat | candidates
+  const [activeDebateStage, setActiveDebateStage] = useState(localStorage.getItem("crucible_activeDebateStage") || "reviews");
+  const [selectedCandidateIdx, setSelectedCandidateIdx] = useState(localStorage.getItem("crucible_selectedCandidateIdx") ? Number(localStorage.getItem("crucible_selectedCandidateIdx")) : 0);
   const [selectedImprovements, setSelectedImprovements] = useState({});
-  const [activeVersionIdx, setActiveVersionIdx] = useState(0);
+  const [activeVersionIdx, setActiveVersionIdx] = useState(localStorage.getItem("crucible_activeVersionIdx") ? Number(localStorage.getItem("crucible_activeVersionIdx")) : 0);
+
+  useEffect(() => { localStorage.setItem("crucible_activeTab", activeTab); }, [activeTab]);
+  useEffect(() => { localStorage.setItem("crucible_activeTabSubView", activeTabSubView); }, [activeTabSubView]);
+  useEffect(() => { localStorage.setItem("crucible_activeDebateStage", activeDebateStage); }, [activeDebateStage]);
+  useEffect(() => { localStorage.setItem("crucible_selectedCandidateIdx", selectedCandidateIdx); }, [selectedCandidateIdx]);
+  useEffect(() => { localStorage.setItem("crucible_activeVersionIdx", activeVersionIdx); }, [activeVersionIdx]);
+
 
   const toggleImprovement = (idx) => {
     setSelectedImprovements(prev => ({
@@ -145,6 +152,14 @@ export default function App() {
       loadProjects();
       loadCollaboratedProjects();
       loadInvitations();
+
+      const savedProjectId = localStorage.getItem("crucible_activeProjectId");
+      if (savedProjectId) {
+        const savedCandIdx = localStorage.getItem("crucible_selectedCandidateIdx") 
+          ? Number(localStorage.getItem("crucible_selectedCandidateIdx")) 
+          : 0;
+        loadProjectDetails(savedProjectId, savedCandIdx, true);
+      }
     }
   }, [token]);
 
@@ -161,10 +176,12 @@ export default function App() {
       const data = activeProject.project_data;
       if (data) {
         const hasRefinement = data.refinement !== undefined;
-        if (hasRefinement) {
-          setActiveDebateStage("reviews");
-        } else {
-          setActiveDebateStage("proposals");
+        if (!localStorage.getItem("crucible_activeDebateStage")) {
+          if (hasRefinement) {
+            setActiveDebateStage("reviews");
+          } else {
+            setActiveDebateStage("proposals");
+          }
         }
       }
     }
@@ -321,7 +338,10 @@ export default function App() {
           stopProgressTimer();
           appendConsoleLine(`[ERROR] Failed to start refinement: ${err.message}`, "#ffb4ab");
           showNotice("error", "Failed to start the refinement debate: " + err.message);
-          setActiveTab("dashboard");
+        },
+        onDone: () => {
+          stopProgressTimer();
+          loadProjectDetails(activeProject.id);
         }
       }
     );
@@ -342,44 +362,21 @@ export default function App() {
   };
 
   const getActiveCandidateInfo = () => {
-    const idx = selectedCandidateIdx ?? 0;
-    if (!loadedResult && !activeProject) {
+    if (!loadedResult) return null;
+    const activeIdx = selectedCandidateIdx !== undefined ? selectedCandidateIdx : 0;
+    
+    if (activeVersionIdx === 0 && Array.isArray(loadedResult.candidates) && loadedResult.candidates.length > activeIdx) {
+      return loadedResult.candidates[activeIdx];
+    }
+    const vers = (loadedResult.versions || [])[activeVersionIdx - 1];
+    if (vers) {
       return {
-        title: "Project Concept",
-        idea: "Project idea concept pending refinement.",
-        agent: "Innovation Agent",
+        title: vers.title || activeProject?.name,
+        idea: vers.moderator?.refined_idea || "",
         fit: 8,
-        problem: "No problem statement specified.",
-        evidence: [],
-        counterfact: []
+        problem: "Refined concept"
       };
     }
-
-    if (loadedResult?.candidates && Array.isArray(loadedResult.candidates) && loadedResult.candidates[idx]) {
-      const cand = loadedResult.candidates[idx];
-      return {
-        title: cand.title || activeProject?.name || "Candidate Idea",
-        idea: cand.idea || cand.problem || cand.title || activeProject?.name || "",
-        agent: cand.agent || cand.creator || "Innovation Agent",
-        fit: cand.hackathon_fit || 8,
-        problem: cand.problem || "No problem statement provided.",
-        evidence: Array.isArray(cand.evidence) ? cand.evidence : [],
-        counterfact: Array.isArray(cand.counterfact) ? cand.counterfact : []
-      };
-    }
-
-    if (loadedResult?.selected_candidate) {
-      return {
-        title: loadedResult.selected_candidate.title || activeProject?.name || "Selected Concept",
-        idea: loadedResult.selected_candidate.idea || activeProject?.name || "",
-        agent: "Moderator Agent",
-        fit: 9,
-        problem: loadedResult?.problem || "Refined concept problem statement.",
-        evidence: Array.isArray(loadedResult?.evidence) ? loadedResult.evidence : [],
-        counterfact: []
-      };
-    }
-
     return {
       title: activeProject?.name || "Project Concept",
       idea: loadedResult?.idea || activeProject?.name || "",
@@ -400,8 +397,8 @@ export default function App() {
     setChatLoading(true);
 
     const agentDisplay = `${selectedAgentForChat.charAt(0).toUpperCase()}${selectedAgentForChat.slice(1)} Agent`;
-    setChats(prev => [...prev, { sender: username, message: userMessage, created_at: new Date().toISOString() }]);
-    setChats(prev => [...prev, { sender: agentDisplay, message: "", created_at: new Date().toISOString(), streaming: true }]);
+    setChats(prev => [...prev, { agent: selectedAgentForChat, sender: username, message: userMessage, created_at: new Date().toISOString() }]);
+    setChats(prev => [...prev, { agent: selectedAgentForChat, sender: agentDisplay, message: "", created_at: new Date().toISOString(), streaming: true }]);
 
     const updateLastChat = (updater) => {
       setChats(prev => {
@@ -452,11 +449,13 @@ export default function App() {
     }
   };
 
-  const loadProjectDetails = async (projectId, candidateIdx = 0) => {
+  const loadProjectDetails = async (projectId, candidateIdx = 0, isInitialLoad = false) => {
     if (!projectId) return;
     setProjectLoading(true);
-    setActiveTab("dashboard");
-    setSelectedCandidateIdx(candidateIdx);
+    if (!isInitialLoad) {
+      setActiveTab("dashboard");
+      setSelectedCandidateIdx(candidateIdx);
+    }
     setSelectedImprovements({});
 
     try {
@@ -475,24 +474,21 @@ export default function App() {
           }
         }
         setActiveProject(data);
+        localStorage.setItem("crucible_activeProjectId", data.id);
         setLoadedResult(parsedData);
-        setActiveVersionIdx(Array.isArray(parsedData.versions) && parsedData.versions.length
-          ? parsedData.versions.length - 1
-          : 0);
+        if (!isInitialLoad) {
+          setActiveVersionIdx(Array.isArray(parsedData.versions) && parsedData.versions.length
+            ? parsedData.versions.length - 1
+            : 0);
+        }
         loadCollaborators(projectId);
 
-        // Load chats
-        const chatRes = await fetch(`${API_BASE}/api/projects/${projectId}/chats`, {
-          headers: { "Authorization": `Bearer ${token}` }
-        });
-        if (chatRes.ok) {
-          const chatData = await chatRes.json();
-          setChats(Array.isArray(chatData) ? chatData : []);
-        } else {
-          setChats([]);
-        }
+        // Clear previous chat context so the chat UI is fresh for each session
+        setChats([]);
 
-        setActiveTabSubView("overview");
+        if (!isInitialLoad) {
+          setActiveTabSubView("overview");
+        }
       } else {
         console.error("Failed to fetch project details", res.status);
       }
@@ -515,6 +511,7 @@ export default function App() {
         setCollaboratedProjects(prev => prev.filter(p => p.id !== projectId));
         if (activeProject?.id === projectId) {
           setActiveProject(null);
+          localStorage.removeItem("crucible_activeProjectId");
           setLoadedResult(null);
           setChats([]);
           setActiveTab("pathway");
@@ -661,6 +658,7 @@ export default function App() {
     localStorage.removeItem("crucible_username");
     localStorage.removeItem("crucible_email");
     localStorage.removeItem("crucible_provider");
+    localStorage.removeItem("crucible_activeProjectId");
     setActiveProject(null);
     setLoadedResult(null);
     setChats([]);
@@ -742,13 +740,14 @@ export default function App() {
     setConsoleLogs(prev => [...prev, { text, color }]);
   };
 
-  const addAgentLog = (agent, text, style = AGENT_STYLE.moderator) => {
+  const addAgentLog = (agent, text, style = AGENT_STYLE.moderator, metadata = {}) => {
     setConsoleLogs(prev => [...prev, {
       agent,
       avatar: style.avatar,
       color: style.color,
       text,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      ...metadata
     }]);
   };
 
@@ -815,9 +814,9 @@ export default function App() {
         }
         replies.forEach(r => {
           const stance = (r.stance || "").toLowerCase().includes("disagree")
-            ? "DISAGREES with"
-            : "responds to";
-          addAgentLog(display, `${stance} ${r.reply_to}: ${r.argument}`, style);
+            ? "DISAGREES"
+            : "RESPONDS";
+          addAgentLog(display, r.argument, style, { action: stance, target: r.reply_to });
         });
         return;
       }
@@ -825,18 +824,19 @@ export default function App() {
       if (phase === "review" || phase === "reflection") {
         const d = data.data || {};
         const score = d.score !== undefined ? d.score : (d.new_score !== undefined ? d.new_score : null);
+        const oldScore = d.old_score !== undefined ? d.old_score : null;
         const strengths = Array.isArray(d.strengths) ? d.strengths : (Array.isArray(d.pros) ? d.pros : []);
-        const label = phase === "review" ? "Independent review complete" : "Reflection complete";
-        const scoreTxt = score !== null ? ` | Score ${score}/10` : "";
-        addAgentLog(display, `${label}${scoreTxt}${strengths[0] ? " — " + strengths[0] : ""}`, style);
+        const label = phase === "review" ? "Independent review" : "Reflection";
+        const msg = strengths[0] ? strengths[0] : (d.analysis || d.critique || d.reason || "Review completed.");
+        addAgentLog(display, msg, style, { action: label, score: score, oldScore: oldScore });
         return;
       }
 
       if (phase === "proposal") {
         const d = data.data || {};
         const title = d.title || d.idea || "";
-        const fit = d.hackathon_fit !== undefined ? ` (fit ${d.hackathon_fit}/10)` : "";
-        addAgentLog(display, `Proposed idea: ${title}${fit}`, style);
+        const fit = d.hackathon_fit !== undefined ? d.hackathon_fit : null;
+        addAgentLog(display, title, style, { action: "Proposed idea", score: fit });
         return;
       }
 
@@ -844,8 +844,8 @@ export default function App() {
         const d = data.data || {};
         const consensus = Array.isArray(d.consensus)
           ? d.consensus.join("; ")
-          : (d.synthesized_consensus || d.refined_idea || "");
-        addAgentLog(display, `Moderator synthesis complete — ${consensus || "consensus reached."}`, style);
+          : (d.synthesized_consensus || d.refined_idea || "Consensus reached.");
+        addAgentLog(display, consensus, style, { action: "Synthesis" });
         return;
       }
 
@@ -963,7 +963,18 @@ export default function App() {
       else rejected.push(chk.value);
     });
 
-    const _versionList = Array.isArray(loadedResult.versions) ? loadedResult.versions : null;
+    let _versionList = null;
+    if (Array.isArray(loadedResult.candidates) && loadedResult.candidates.length > 0) {
+      if (selectedCandidateIdx !== undefined && loadedResult.candidates.length > selectedCandidateIdx) {
+        const cand = loadedResult.candidates[selectedCandidateIdx];
+        if (cand.versions && cand.versions.length > 0) _versionList = cand.versions;
+      }
+    } else {
+      if (!_versionList) {
+        _versionList = Array.isArray(loadedResult.versions) ? loadedResult.versions : null;
+      }
+    }
+
     const _curVersion = _versionList && _versionList.length
       ? _versionList[Math.min(activeVersionIdx, _versionList.length - 1)]
       : null;
@@ -983,7 +994,8 @@ export default function App() {
       theme: null,
       team_size: null,
       time_hours: null,
-      project_id: activeProject.id
+      project_id: activeProject.id,
+      candidate_idx: selectedCandidateIdx !== undefined ? selectedCandidateIdx : null
     };
 
     await streamPipeline(`${API_BASE}/idea/refine`, payload, {
@@ -1134,18 +1146,37 @@ export default function App() {
     activeCand.title?.toLowerCase().includes(loadedResult.selected_candidate.title?.toLowerCase())
   );
 
-  const versionList = Array.isArray(loadedResult?.versions) ? loadedResult.versions : null;
-  const activeVersion = versionList && versionList.length > 0
-    ? versionList[Math.min(activeVersionIdx, versionList.length - 1)]
+  const versionList = (() => {
+    if (!loadedResult) return null;
+    
+    // Treat undefined as index 0 (project root views default to showing Candidate #1's info)
+    const activeIdx = selectedCandidateIdx !== undefined ? selectedCandidateIdx : 0;
+    
+    // First, check if the currently selected candidate has its own isolated versions
+    if (Array.isArray(loadedResult.candidates) && loadedResult.candidates.length > activeIdx) {
+      const cand = loadedResult.candidates[activeIdx];
+      if (cand.versions && cand.versions.length > 0) return cand.versions;
+    }
+    
+    // Fallback for legacy data: lock global versions strictly to Idea #1 (index 0) so they don't leak
+    if (activeIdx === 0) {
+      return Array.isArray(loadedResult.versions) ? loadedResult.versions : null;
+    }
+    return null;
+  })();
+  const activeVersion = versionList && activeVersionIdx > 0 && activeVersionIdx <= versionList.length
+    ? versionList[activeVersionIdx - 1]
     : null;
 
-  const innerResult = loadedResult
-    ? (activeVersion
-        ? activeVersion
-        : (loadedResult.selected_candidate
-            ? (isCurrentCandidateRefined ? (loadedResult.refinement || {}) : {})
-            : (loadedResult.result || loadedResult.refinement || loadedResult)))
-    : {};
+  const innerResult = (() => {
+    if (activeVersion) return activeVersion;
+    // For legacy data, only fallback to global refinement if viewing Candidate 0 or project root
+    if (selectedCandidateIdx === 0 || selectedCandidateIdx === undefined) {
+      return loadedResult?.refinement || loadedResult;
+    }
+    // For Candidate > 0, do not leak global refinement
+    return loadedResult;
+  })();
   const isGenerationKind = loadedResult && (loadedResult.kind === "generate" || !!innerResult?.conclusion);
 
   // Normalize refinement data across storage shapes so the debate workspace always renders

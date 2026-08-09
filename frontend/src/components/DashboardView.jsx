@@ -100,21 +100,28 @@ export default function DashboardView() {
                 {getActiveCandidateInfo()?.title || activeProject?.name || "Project dashboard"}
               </h1>
               <p className="mt-1 text-xs text-slate-400">Project ID: {activeProject?.id}</p>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {versionList && versionList.length > 1 && (
-                <div className="flex items-center gap-1 rounded-lg border border-slate-200 p-1 dark:border-[#272c3d]">
+              
+              {versionList && versionList.length > 0 && (
+                <div className="mt-4 flex flex-wrap items-center gap-1 rounded-lg border border-slate-200 p-1 dark:border-[#272c3d] w-max max-w-full">
+                  <button
+                    onClick={() => { setActiveVersionIdx(0); setActiveDebateStage("reviews"); }}
+                    className={`rounded-md px-2 py-1 text-xs font-medium ${activeVersionIdx === 0 ? "bg-gradient-to-r from-indigo-600 to-violet-600 text-white" : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-[#1a1e2b]"}`}
+                  >
+                    Original
+                  </button>
                   {versionList.map((v, idx) => (
                     <button
                       key={v.version ?? idx}
-                      onClick={() => { setActiveVersionIdx(idx); setActiveDebateStage("reviews"); }}
-                      className={`rounded-md px-2 py-1 text-xs font-medium ${idx === Math.min(activeVersionIdx, versionList.length - 1) ? "bg-gradient-to-r from-indigo-600 to-violet-600 text-white" : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-[#1a1e2b]"}`}
+                      onClick={() => { setActiveVersionIdx(idx + 1); setActiveDebateStage("reviews"); }}
+                      className={`rounded-md px-2 py-1 text-xs font-medium ${activeVersionIdx === idx + 1 ? "bg-gradient-to-r from-indigo-600 to-violet-600 text-white" : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-[#1a1e2b]"}`}
                     >
                       Version {v.version ?? idx + 1}
                     </button>
                   ))}
                 </div>
               )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
               <Button onClick={handleRefineCurrentIdea}>
                 <span className="material-symbols-outlined text-base">rocket_launch</span>
                 {loadedResult?.refinement || innerResult?.moderator ? "Iterate" : "Refine"}
@@ -559,8 +566,8 @@ export default function DashboardView() {
 
                     if (!refl) return null;
 
-                    const original = refl.original_stance || "neutral";
-                    const updated = refl.updated_stance || "concur";
+                    const oldScore = refl.old_score !== undefined ? refl.old_score : (refl.score || 0);
+                    const newScore = refl.new_score !== undefined ? refl.new_score : (refl.score || 0);
 
                     return (
                       <Card key={agent.id} className="flex flex-col p-5">
@@ -570,30 +577,24 @@ export default function DashboardView() {
                             <h3 className="text-sm font-semibold text-slate-900 dark:text-white">{agent.name}</h3>
                           </div>
                           <div className="flex items-center gap-1.5 text-xs font-medium">
-                            <span className="text-slate-400">{original}</span>
+                            <span className="text-slate-400">Score: {oldScore}</span>
                             <span className="material-symbols-outlined text-sm text-slate-400">arrow_forward</span>
-                            <span className="text-emerald-600 dark:text-emerald-400">{updated}</span>
+                            <span className="text-emerald-600 dark:text-emerald-400">{newScore}/10</span>
                           </div>
                         </div>
                         <div className="mt-3 flex-1 space-y-3 text-sm">
                           <div>
                             <SectionLabel>Reflection rationale</SectionLabel>
-                            <p className="mt-1 leading-relaxed text-slate-600 dark:text-slate-300">{refl.reflection_rationale || "Conceded points and accepted peer reviews."}</p>
+                            <p className="mt-1 leading-relaxed text-slate-600 dark:text-slate-300">{refl.reason || refl.reflection_rationale || "Conceded points and accepted peer reviews."}</p>
                           </div>
-                          {refl.concessions && refl.concessions.length > 0 && (
+                          {refl.updated_suggestions && refl.updated_suggestions.length > 0 && (
                             <div>
-                              <SectionLabel>Concessions made</SectionLabel>
+                              <SectionLabel>Updated suggestions</SectionLabel>
                               <ul className="mt-1 list-inside list-disc space-y-1 text-slate-600 dark:text-slate-300">
-                                {refl.concessions.map((conc, idx) => (
-                                  <li key={idx}>{conc}</li>
+                                {refl.updated_suggestions.map((sugg, idx) => (
+                                  <li key={idx}>{sugg}</li>
                                 ))}
                               </ul>
-                            </div>
-                          )}
-                          {refl.updated_critique && (
-                            <div>
-                              <SectionLabel>Updated critique</SectionLabel>
-                              <p className="mt-1 whitespace-pre-wrap leading-relaxed text-slate-600 dark:text-slate-300">{refl.updated_critique}</p>
                             </div>
                           )}
                         </div>
@@ -685,14 +686,24 @@ export default function DashboardView() {
                     {chats && chats.length > 0 ? (
                       chats.map((chat, idx) => {
                         const isUser = chat.sender.toLowerCase() === username.toLowerCase();
+                        let agentStyle = {};
+                        if (!isUser) {
+                          const meta = AGENT_BY_ID[agentIdFromName(chat.sender)] || AGENT_BY_ID.moderator;
+                          if (meta && meta.color) {
+                            agentStyle = { borderLeftColor: meta.color, borderLeftWidth: '4px', background: meta.color + "10" };
+                          }
+                        }
                         return (
                           <div key={idx} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-                            <div className={`max-w-[80%] rounded-lg border px-3 py-2 ${isUser ? "border-indigo-600 bg-gradient-to-r from-indigo-600 to-violet-600 text-white" : "border-slate-200 bg-white dark:border-[#272c3d] dark:bg-[#1a1e2b]"}`}>
+                            <div 
+                              className={`max-w-[80%] rounded-lg border px-3 py-2 ${isUser ? "border-indigo-600 bg-gradient-to-r from-indigo-600 to-violet-600 text-white" : "border-slate-200 bg-white dark:border-[#272c3d] dark:bg-[#1a1e2b]"}`}
+                              style={agentStyle}
+                            >
                               <div className={`mb-1 flex justify-between gap-4 text-[10px] ${isUser ? "text-indigo-200" : "text-slate-400 dark:text-slate-500"}`}>
-                                <span className="font-medium">{chat.sender}</span>
+                                <span className="font-medium" style={!isUser && agentStyle.borderLeftColor ? {color: agentStyle.borderLeftColor} : {}}>{chat.sender}</span>
                                 <span>{new Date(chat.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                               </div>
-                              <p className="break-words text-sm leading-relaxed">{chat.message}</p>
+                              <p className="break-words text-sm leading-relaxed whitespace-pre-wrap">{chat.message}</p>
                             </div>
                           </div>
                         );

@@ -51,12 +51,28 @@ export default function RunningView() {
                 <AgentAvatar agent={meta} size="sm" />
                 <div className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 dark:border-[#272c3d] dark:bg-[#1a1e2b]">
                   <div className="flex items-baseline justify-between gap-3">
-                    <span className="text-xs font-semibold" style={{ color: meta.color }}>{log.agent}</span>
-                    <span className="text-[10px] text-slate-400 dark:text-slate-500">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-semibold" style={{ color: meta.color }}>{log.agent}</span>
+                      {log.action && (
+                        <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${
+                          log.action === 'DISAGREES' ? 'bg-rose-100 text-rose-700 dark:bg-rose-500/20 dark:text-rose-400' :
+                          log.action === 'RESPONDS' ? 'bg-slate-100 text-slate-700 dark:bg-slate-700/50 dark:text-slate-300' :
+                          'bg-indigo-50 text-indigo-700 dark:bg-indigo-500/20 dark:text-indigo-300'
+                        }`}>
+                          {log.action} {log.target ? `to ${log.target}` : ''}
+                        </span>
+                      )}
+                      {log.score !== undefined && log.score !== null && (
+                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-400">
+                          Score: {log.oldScore !== undefined && log.oldScore !== null && log.oldScore !== log.score ? `${log.oldScore} → ${log.score}/10` : `${log.score}/10`}
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-[10px] text-slate-400 dark:text-slate-500 whitespace-nowrap">
                       {log.timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                     </span>
                   </div>
-                  <p className="mt-0.5 text-sm leading-relaxed text-slate-700 dark:text-slate-200">{log.text}</p>
+                  <p className="mt-1 text-sm leading-relaxed text-slate-700 dark:text-slate-200">{log.text}</p>
                 </div>
               </div>
             );

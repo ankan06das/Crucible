@@ -229,6 +229,7 @@ class RefReqWithProject(BaseModel):
     team_size: Optional[int] = None
     time_hours: Optional[int] = None
     project_id: Optional[str] = None
+    candidate_idx: Optional[int] = None
 
 
 # Helpers
@@ -629,7 +630,7 @@ async def handle_generate(req: GenReqWithProject, request: Request, authorizatio
         project_data = {
             "status": "pending_selection",
             "candidates": result.get("candidates", []),
-            "research": result.get("research", None),
+            "research": result.get("research"),
             "proposals": result.get("proposals", {}),
             "debates": result.get("debates", {}),
             "context": result.get("context", "")
@@ -643,7 +644,7 @@ async def handle_generate(req: GenReqWithProject, request: Request, authorizatio
             (project_id, resolved_user_id, req.project_name, created_at, project_data_json),
         )
 
-        for agent, round_data in result.get("debates", {}).items():
+        for agent, round_data in (project_data.get("debates") or {}).items():
             if round_data and "root" in round_data:
                 for reply in round_data["root"]:
                     msg_id = str(uuid.uuid4())
@@ -665,7 +666,7 @@ async def handle_generate(req: GenReqWithProject, request: Request, authorizatio
             "project_id": project_id,
             "project_name": req.project_name,
             "status": "pending_selection",
-            "candidates": result.get("candidates", []),
+            "candidates": project_data["candidates"],
         })
 
     return StreamingResponse(
@@ -712,11 +713,11 @@ async def select_candidate(project_id: str, req: SelectCandidateRequest, request
         result = await run_pipeline(request.app, req.idea, idea_context=context, emit=emit)
 
         res_dict = {
-            "reviews": {k: v.model_dump() for k, v in result.reviews.items()},
-            "debate": {k: v.model_dump() for k, v in result.debate.items()},
-            "reflections": {k: v.model_dump() for k, v in result.reflections.items()},
-            "moderator": result.moderator.model_dump() if result.moderator else None,
-            "research": {k: v.model_dump() for k, v in result.research.items()},
+            "reviews": {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in result.reviews.items()},
+            "debate": {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in result.debate.items()},
+            "reflections": {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in result.reflections.items()},
+            "moderator": result.moderator.model_dump() if hasattr(result.moderator, "model_dump") else result.moderator,
+            "research": {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in result.research.items()},
         }
 
         conn = await get_conn()
@@ -732,10 +733,17 @@ async def select_candidate(project_id: str, req: SelectCandidateRequest, request
 
         created_at = datetime.datetime.utcnow().isoformat()
         for agent, round_data in result.debate.items():
-            if round_data and round_data.root:
-                for reply in round_data.root:
+            if round_data:
+                root = round_data.root if hasattr(round_data, "root") else round_data.get("root", [])
+                for reply in root:
                     msg_id = str(uuid.uuid4())
-                    message_text = f"Debated {reply.reply_to} ({reply.stance.value}): {reply.argument}"
+                    
+                    reply_to = getattr(reply, "reply_to", reply.get("reply_to", "")) if isinstance(reply, dict) else reply.reply_to
+                    stance = getattr(reply, "stance", reply.get("stance", "neutral")) if isinstance(reply, dict) else reply.stance
+                    stance_val = stance.value if hasattr(stance, "value") else (stance.get("value") if isinstance(stance, dict) else stance)
+                    argument = getattr(reply, "argument", reply.get("argument", "")) if isinstance(reply, dict) else reply.argument
+
+                    message_text = f"Debated {reply_to} ({stance_val}): {argument}"
                     await c.execute(
                         "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (%s, %s, %s, %s, %s)",
                         (msg_id, project_id, agent, message_text, created_at),
@@ -774,11 +782,11 @@ async def handle_refine(req: RefReqWithProject, request: Request, authorization:
 
         res_dict = {
             "idea": req.idea,
-            "reviews": {k: v.model_dump() for k, v in result.reviews.items()},
-            "debate": {k: v.model_dump() for k, v in result.debate.items()},
-            "reflections": {k: v.model_dump() for k, v in result.reflections.items()},
-            "moderator": result.moderator.model_dump() if result.moderator else None,
-            "research": {k: v.model_dump() for k, v in result.research.items()},
+            "reviews": {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in result.reviews.items()},
+            "debate": {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in result.debate.items()},
+            "reflections": {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in result.reflections.items()},
+            "moderator": result.moderator.model_dump() if hasattr(result.moderator, "model_dump") else result.moderator,
+            "research": {k: (v.model_dump() if hasattr(v, "model_dump") else v) for k, v in result.research.items()},
         }
 
         project_id = req.project_id or str(uuid.uuid4())
@@ -791,8 +799,13 @@ async def handle_refine(req: RefReqWithProject, request: Request, authorization:
         # version to the SAME project instead of creating a brand-new one.
         if req.project_id:
             await c.execute(
-                "SELECT project_data, name FROM projects WHERE id = %s AND user_id = %s",
-                (req.project_id, resolved_user_id),
+                """
+                SELECT p.project_data, p.name 
+                FROM projects p
+                LEFT JOIN project_collaborators pc ON p.id = pc.project_id
+                WHERE p.id = %s AND (p.user_id = %s OR pc.user_id = %s)
+                """,
+                (req.project_id, resolved_user_id, resolved_user_id),
             )
             row = await c.fetchone()
             if not row:
@@ -802,22 +815,28 @@ async def handle_refine(req: RefReqWithProject, request: Request, authorization:
             if not req.project_name:
                 req.project_name = row[1]
 
-        versions = project_data.get("versions")
+        cand = None
+        if req.candidate_idx is not None and isinstance(project_data.get("candidates"), list) and req.candidate_idx < len(project_data["candidates"]):
+            cand = project_data["candidates"][req.candidate_idx]
+            versions = cand.get("versions")
+        else:
+            versions = project_data.get("versions")
+
         if not isinstance(versions, list):
-            # Seed any legacy refinement as version 1 so iterations stack cleanly.
             versions = []
-            legacy = project_data.get("refinement")
-            if isinstance(legacy, dict):
-                versions.append({
-                    "version": 1,
-                    "created_at": project_data.get("created_at", created_at),
-                    "idea": legacy.get("idea", ""),
-                    "reviews": legacy.get("reviews", {}),
-                    "debate": legacy.get("debate", {}),
-                    "reflections": legacy.get("reflections", {}),
-                    "moderator": legacy.get("moderator", None),
-                    "research": legacy.get("research", {}),
-                })
+            if not cand:
+                legacy = project_data.get("refinement")
+                if isinstance(legacy, dict):
+                    versions.append({
+                        "version": 1,
+                        "created_at": project_data.get("created_at", created_at),
+                        "idea": legacy.get("idea", ""),
+                        "reviews": legacy.get("reviews", {}),
+                        "debate": legacy.get("debate", {}),
+                        "reflections": legacy.get("reflections", {}),
+                        "moderator": legacy.get("moderator", None),
+                        "research": legacy.get("research", {}),
+                    })
 
         next_version = (versions[-1]["version"] + 1) if versions else 1
 
@@ -833,9 +852,13 @@ async def handle_refine(req: RefReqWithProject, request: Request, authorization:
         }
         versions.append(version_obj)
 
-        # Keep latest version mirrored under `refinement` for backward compat.
-        project_data["versions"] = versions
-        project_data["refinement"] = res_dict
+        if cand:
+            cand["versions"] = versions
+            # Don't overwrite the global refinement data when iterating a specific candidate!
+        else:
+            project_data["versions"] = versions
+            project_data["refinement"] = res_dict
+
         project_data["created_at"] = created_at
 
         project_data_json = json.dumps(project_data, default=str)
@@ -852,10 +875,17 @@ async def handle_refine(req: RefReqWithProject, request: Request, authorization:
             )
 
         for agent, round_data in result.debate.items():
-            if round_data and round_data.root:
-                for reply in round_data.root:
+            if round_data:
+                root = round_data.root if hasattr(round_data, "root") else round_data.get("root", [])
+                for reply in root:
                     msg_id = str(uuid.uuid4())
-                    message_text = f"Debated {reply.reply_to} ({reply.stance.value}): {reply.argument}"
+                    
+                    reply_to = getattr(reply, "reply_to", reply.get("reply_to", "")) if isinstance(reply, dict) else reply.reply_to
+                    stance = getattr(reply, "stance", reply.get("stance", "neutral")) if isinstance(reply, dict) else reply.stance
+                    stance_val = stance.value if hasattr(stance, "value") else (stance.get("value") if isinstance(stance, dict) else stance)
+                    argument = getattr(reply, "argument", reply.get("argument", "")) if isinstance(reply, dict) else reply.argument
+
+                    message_text = f"Debated {reply_to} ({stance_val}): {argument}"
                     await c.execute(
                         "INSERT INTO chats (id, project_id, sender, message, created_at) VALUES (%s, %s, %s, %s, %s)",
                         (msg_id, project_id, agent, message_text, created_at),

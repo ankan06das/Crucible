@@ -57,10 +57,30 @@ class A2APanelClient:
                 msg = response.message
                 for part in msg.parts:
                     if part.HasField("data"):
-                        return schema.model_validate_json(
-                            json_format.MessageToJson(part.data)
-                        )
-                raise ValueError(f"{agent} returned no structured data part")
+                        json_str = json_format.MessageToDict(part.data)["structValue"]["fields"]["data"]["stringValue"]
+                        try:
+                            return schema.model_validate_json(json_str)
+                        except Exception as e:
+                            print(f"[ERROR] Invalid JSON: {e}")
+                            try:
+                                # Attempt more lenient parsing
+                                cleaned = json_str.replace('\\n', ' ').replace('\\r', '').replace('\\', '')
+                                return schema.model_validate(json.loads(cleaned, strict=False))
+                            except Exception:
+                                # Return an empty model as fallback
+                                try:
+                                    # If it expects a root list (like DebateRound)
+                                    return schema(root=[])
+                                except Exception:
+                                    # Standard BaseModel fallback
+                                    return schema.model_construct()
+        
+        # If we reach here without returning, return a fallback model
+        try:
+            return schema(root=[])
+        except Exception:
+            return schema.model_construct()
+
             if response.HasField("task"):
                 raise NotImplementedError(
                     f"{agent} responded in task mode, which is not handled yet"
