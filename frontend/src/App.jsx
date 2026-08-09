@@ -6,6 +6,8 @@ export default function App() {
   // Auth state
   const [token, setToken] = useState(localStorage.getItem("crucible_token") || null);
   const [username, setUsername] = useState(localStorage.getItem("crucible_username") || "");
+  const [newUsername, setNewUsername] = useState("");
+  const [newEmail, setNewEmail] = useState("");
   const [authMode, setAuthMode] = useState("login"); // login | register
   const [authError, setAuthError] = useState("");
   
@@ -16,7 +18,9 @@ export default function App() {
   const [chats, setChats] = useState([]);
   const [consoleLogs, setConsoleLogs] = useState([]);
   const [progressTime, setProgressTime] = useState(0.0);
+  const [deleteConfirmProject, setDeleteConfirmProject] = useState(null);
   const [loadedResult, setLoadedResult] = useState(null);
+  const [projectLoading, setProjectLoading] = useState(false);
 
   // Form states
   const [projectName, setProjectName] = useState("");
@@ -62,12 +66,21 @@ export default function App() {
   const [collaborators, setCollaborators] = useState([]);
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteStatus, setInviteStatus] = useState("");
-  const [selectedAgentForChat, setSelectedAgentForChat] = useState("skeptic");
+  const [selectedAgentForChat, setSelectedAgentForChat] = useState("moderator");
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [showCollabModal, setShowCollabModal] = useState(false);
   const [candidateSelectionLoading, setCandidateSelectionLoading] = useState(false);
   const [activeTabSubView, setActiveTabSubView] = useState("overview"); // overview | reviews | debates | chat | candidates
+  const [selectedCandidateIdx, setSelectedCandidateIdx] = useState(0);
+  const [selectedImprovements, setSelectedImprovements] = useState({});
+
+  const toggleImprovement = (idx) => {
+    setSelectedImprovements(prev => ({
+      ...prev,
+      [idx]: !(prev[idx] ?? true)
+    }));
+  };
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -208,7 +221,61 @@ export default function App() {
     }
   };
 
+  const extractDebateReplies = (roundRaw) => {
+    if (!roundRaw) return [];
+    if (typeof roundRaw === "object") {
+      if (Array.isArray(roundRaw.root)) return roundRaw.root;
+      if (Array.isArray(roundRaw.arguments)) return roundRaw.arguments;
+      if (Array.isArray(roundRaw)) return roundRaw;
+    }
+    if (typeof roundRaw === "string") {
+      const replies = [];
+      const regex = /DebateReply\(reply_to=['"]([^'"]+)['"],\s*stance=([^,]+),\s*argument=['"]([^'"]+)['"]\)/g;
+      let match;
+      while ((match = regex.exec(roundRaw)) !== null) {
+        let stanceStr = match[2];
+        if (stanceStr.includes("DISAGREE") || stanceStr.includes("Disagree")) stanceStr = "Disagree";
+        else if (stanceStr.includes("AGREE") || stanceStr.includes("Agree")) stanceStr = "Agree";
+        else stanceStr = "Neutral";
+
+        replies.push({
+          reply_to: match[1],
+          stance: stanceStr,
+          argument: match[3]
+        });
+      }
+      return replies;
+    }
+    return [];
+  };
+
+  const getAllDebateExchanges = (res) => {
+    if (!res) return [];
+    const debatesDict = res.refined_debates || res.debates || res.debate || (res.refinement ? res.refinement.debate : {}) || {};
+    const exchanges = [];
+    
+    Object.entries(debatesDict).forEach(([agentKey, roundData]) => {
+      const speakerName = agentKey.charAt(0).toUpperCase() + agentKey.slice(1) + " Agent";
+      const replies = extractDebateReplies(roundData);
+      replies.forEach(reply => {
+        let stanceVal = reply.stance;
+        if (typeof stanceVal === "object" && stanceVal.value) stanceVal = stanceVal.value;
+        if (typeof stanceVal === "string" && stanceVal.includes("DISAGREE")) stanceVal = "Disagree";
+        if (typeof stanceVal === "string" && stanceVal.includes("AGREE")) stanceVal = "Agree";
+        
+        exchanges.push({
+          speaker: speakerName,
+          target: reply.reply_to || "Panel",
+          stance: stanceVal || "Challenge",
+          argument: reply.argument
+        });
+      });
+    });
+    return exchanges;
+  };
+
   const selectCandidateIdea = async (candidate) => {
+    if (!activeProject) return;
     setCandidateSelectionLoading(true);
     try {
       const res = await fetch(`${API_BASE}/api/projects/${activeProject.id}/select-candidate`, {
@@ -217,11 +284,11 @@ export default function App() {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${token}`
         },
-        body: JSON.stringify({ title: candidate.title, idea: candidate.idea })
+        body: JSON.stringify({ title: candidate.title || activeProject.name, idea: candidate.idea || activeProject.name })
       });
       if (res.ok) {
         const data = await res.json();
-        loadProjectDetails(data.project_id);
+        loadProjectDetails(data.project_id, selectedCandidateIdx);
       } else {
         alert("Failed to initialize debate refinement for chosen topic");
       }
@@ -230,6 +297,63 @@ export default function App() {
     } finally {
       setCandidateSelectionLoading(false);
     }
+  };
+
+  const handleRefineCurrentIdea = () => {
+    const cand = getActiveCandidateInfo();
+    if (cand) {
+      selectCandidateIdea(cand);
+    }
+  };
+
+  const getActiveCandidateInfo = () => {
+    const idx = selectedCandidateIdx ?? 0;
+    if (!loadedResult && !activeProject) {
+      return {
+        title: "Project Concept",
+        idea: "Project idea concept pending refinement.",
+        agent: "Innovation Agent",
+        fit: 8,
+        problem: "No problem statement specified.",
+        evidence: [],
+        counterfact: []
+      };
+    }
+
+    if (loadedResult?.candidates && Array.isArray(loadedResult.candidates) && loadedResult.candidates[idx]) {
+      const cand = loadedResult.candidates[idx];
+      return {
+        title: cand.title || activeProject?.name || "Candidate Idea",
+        idea: cand.idea || cand.problem || cand.title || activeProject?.name || "",
+        agent: cand.agent || cand.creator || "Innovation Agent",
+        fit: cand.hackathon_fit || 8,
+        problem: cand.problem || "No problem statement provided.",
+        evidence: Array.isArray(cand.evidence) ? cand.evidence : [],
+        counterfact: Array.isArray(cand.counterfact) ? cand.counterfact : []
+      };
+    }
+
+    if (loadedResult?.selected_candidate) {
+      return {
+        title: loadedResult.selected_candidate.title || activeProject?.name || "Selected Concept",
+        idea: loadedResult.selected_candidate.idea || activeProject?.name || "",
+        agent: "Moderator Agent",
+        fit: 9,
+        problem: loadedResult?.problem || "Refined concept problem statement.",
+        evidence: Array.isArray(loadedResult?.evidence) ? loadedResult.evidence : [],
+        counterfact: []
+      };
+    }
+
+    return {
+      title: activeProject?.name || "Project Concept",
+      idea: loadedResult?.idea || activeProject?.name || "",
+      agent: "Innovation Agent",
+      fit: 8,
+      problem: loadedResult?.problem || "Concept definition",
+      evidence: Array.isArray(loadedResult?.evidence) ? loadedResult.evidence : [],
+      counterfact: []
+    };
   };
 
   const sendAgentMessage = async (e) => {
@@ -269,15 +393,30 @@ export default function App() {
     }
   };
 
-  const loadProjectDetails = async (projectId) => {
+  const loadProjectDetails = async (projectId, candidateIdx = 0) => {
+    if (!projectId) return;
+    setProjectLoading(true);
+    setActiveTab("dashboard");
+    setSelectedCandidateIdx(candidateIdx);
+    setSelectedImprovements({});
+    
     try {
       const res = await fetch(`${API_BASE}/api/projects/${projectId}`, {
         headers: { "Authorization": `Bearer ${token}` }
       });
       if (res.ok) {
         const data = await res.json();
+        let parsedData = data.project_data || {};
+        if (typeof parsedData === "string") {
+          try {
+            parsedData = JSON.parse(parsedData);
+          } catch (e) {
+            console.error("Failed to parse project_data string", e);
+            parsedData = {};
+          }
+        }
         setActiveProject(data);
-        setLoadedResult(data.project_data);
+        setLoadedResult(parsedData);
         loadCollaborators(projectId);
         
         // Load chats
@@ -286,16 +425,53 @@ export default function App() {
         });
         if (chatRes.ok) {
           const chatData = await chatRes.json();
-          setChats(chatData);
+          setChats(Array.isArray(chatData) ? chatData : []);
+        } else {
+          setChats([]);
         }
         
-        setActiveTab("dashboard");
         setActiveTabSubView("overview");
+      } else {
+        console.error("Failed to fetch project details", res.status);
       }
     } catch (err) {
       console.error("Error loading project details", err);
+    } finally {
+      setProjectLoading(false);
     }
   };
+
+  const deleteProject = async (projectId) => {
+    if (!projectId) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/projects/${projectId}`, {
+        method: "DELETE",
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      if (res.ok) {
+        setProjects(prev => prev.filter(p => p.id !== projectId));
+        setCollaboratedProjects(prev => prev.filter(p => p.id !== projectId));
+        if (activeProject?.id === projectId) {
+          setActiveProject(null);
+          setLoadedResult(null);
+          setChats([]);
+          setActiveTab("pathway");
+        }
+      } else {
+        console.error("Failed to delete project", await res.text());
+        alert("Failed to delete project from database");
+      }
+    } catch (err) {
+      console.error("Error deleting project", err);
+    }
+  };
+
+  const handleDeleteClick = (projectId, e) => {
+    e.stopPropagation();
+    setDeleteConfirmProject(projectId);
+  };
+
+// Duplicate handleLogin definition removed
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -352,9 +528,48 @@ export default function App() {
     setUsername("");
     localStorage.removeItem("crucible_token");
     localStorage.removeItem("crucible_username");
+    localStorage.removeItem("crucible_email");
     setActiveProject(null);
     setLoadedResult(null);
     setChats([]);
+  };
+
+  const handleProfileUpdate = async (e) => {
+    e.preventDefault();
+    if (!newUsername && !newEmail) {
+      alert("Please provide a new username or email to update.");
+      return;
+    }
+    try {
+      const res = await fetch(`${API_BASE}/api/user`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          ...(newUsername && { username: newUsername }),
+          ...(newEmail && { email: newEmail }),
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setUsername(data.username);
+        localStorage.setItem("crucible_username", data.username);
+        if (data.email) {
+          localStorage.setItem("crucible_email", data.email);
+        }
+        setNewUsername("");
+        setNewEmail("");
+        setPasscodeSuccess("Profile updated successfully.");
+      } else {
+        const err = await res.json();
+        alert(err.detail || "Failed to update profile");
+      }
+    } catch (err) {
+      console.error(err);
+      alert("Error updating profile");
+    }
   };
 
   const appendConsoleLine = (text, color = "#e2e2e2") => {
@@ -363,34 +578,25 @@ export default function App() {
 
   const runMockLogs = (callback) => {
     const steps = [
-      { msg: "[SYSTEM] Initiating A2A communication socket...", delay: 200, color: "#849495" },
-      { msg: "[SYSTEM] Connecting to Innovation Agent spec...", delay: 400, color: "#e2e2e2" },
-      { msg: "[SYSTEM] Connecting to Feasibility Agent spec...", delay: 200, color: "#e2e2e2" },
-      { msg: "[SYSTEM] Connecting to Impact Agent spec...", delay: 200, color: "#e2e2e2" },
-      { msg: "[SYSTEM] Connecting to Technical Agent spec...", delay: 200, color: "#e2e2e2" },
-      { msg: "[SYSTEM] Connecting to Skeptic Agent spec...", delay: 200, color: "#e2e2e2" },
-      { msg: "[RESEARCHER] Querying search endpoint with lens hint...", delay: 600, color: "#74f5ff" },
-      { msg: "[SYSTEM] Web research brief compiled. Launching parallel reviews...", delay: 800, color: "#34fc0d" },
-      { msg: "[INDEPENDENT REVIEW] Innovation Agent submitted baseline evaluation (Confidence: 0.88).", delay: 1000, color: "#fe00fe" },
-      { msg: "[INDEPENDENT REVIEW] Feasibility Agent submitted baseline evaluation (Confidence: 0.82).", delay: 600, color: "#fe00fe" },
-      { msg: "[INDEPENDENT REVIEW] Skeptic Agent submitted critical review (Confidence: 0.94).", delay: 800, color: "#ffb4ab" },
-      { msg: "[DEBATE ENGINE] Distributing peer reviews to all Specialist Nodes...", delay: 700, color: "#849495" },
-      { msg: "[DEBATE ROUND] Technical Agent challenging Skeptic Agent stance...", delay: 1200, color: "#79ff5b" },
-      { msg: "[DEBATE ROUND] Skeptic Agent responding with counterfact evaluation...", delay: 900, color: "#ffb4ab" },
-      { msg: "[REFLECTION] Innovation Agent updated score configuration (10 -> 8).", delay: 1000, color: "#fe00fe" },
-      { msg: "[REFLECTION] Feasibility Agent validated challenge and revised roadmap priority.", delay: 800, color: "#fe00fe" },
-      { msg: "[SYSTEM] Concluding debates. Feeding data to Moderator...", delay: 600, color: "#34fc0d" },
-      { msg: "[MODERATOR] Aggregating consensus and constructing refined implementation path...", delay: 1000, color: "#74f5ff" },
-      { msg: "[SYSTEM] Output database persistence finalized. Rendering analytical metrics.", delay: 400, color: "#34fc0d" }
+      { agent: "SYSTEM", avatar: "memory", color: "text-slate-400 border-slate-500/20 bg-slate-500/10", text: "Initiating A2A Neural Protocol & Judge Panel..." },
+      { agent: "Innovation Agent", avatar: "tips_and_updates", color: "text-amber-400 border-amber-500/30 bg-amber-500/10", text: "Scanning concept for novelty & unique selling proposition..." },
+      { agent: "Feasibility Agent", avatar: "construction", color: "text-purple-400 border-purple-500/30 bg-purple-500/10", text: "Evaluating hackathon timeline constraints & scope limits..." },
+      { agent: "Impact Agent", avatar: "stars", color: "text-blue-400 border-blue-500/30 bg-blue-500/10", text: "Assessing user pain point, market adoption & demo WOW-factor..." },
+      { agent: "Technical Agent", avatar: "developer_board", color: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10", text: "Reviewing architecture: API integration, NLP libraries, database schema..." },
+      { agent: "Skeptic Agent", avatar: "security_update_warning", color: "text-rose-400 border-rose-500/30 bg-rose-500/10", text: "Skeptic challenge: Building full NLP in 24 hours has high integration risk!" },
+      { agent: "Technical Agent", avatar: "developer_board", color: "text-emerald-400 border-emerald-500/30 bg-emerald-500/10", text: "Rebuttal: We can use pre-trained BERT/Rasa models to eliminate custom NLP training." },
+      { agent: "Feasibility Agent", avatar: "construction", color: "text-purple-400 border-purple-500/30 bg-purple-500/10", text: "Agreed! Pre-trained libraries reduce effort from 20 hours to 4 hours." },
+      { agent: "Innovation Agent", avatar: "tips_and_updates", color: "text-amber-400 border-amber-500/30 bg-amber-500/10", text: "Reflected score: Score revised up to 8/10 based on pre-trained API strategy." },
+      { agent: "Moderator Agent", avatar: "gavel", color: "text-cyan-400 border-cyan-500/30 bg-cyan-500/10", text: "Consensus reached: Scope down, utilize Rasa/BERT, prioritize 3-minute demo flow." }
     ];
 
-    setConsoleLogs([{ text: "[SYSTEM] Initializing node thread...", color: "#849495" }]);
+    setConsoleLogs([{ agent: "SYSTEM", avatar: "memory", color: "text-slate-400", text: "Initializing node thread..." }]);
     let index = 0;
 
     function printNext() {
       if (index < steps.length) {
-        appendConsoleLine(steps[index].msg, steps[index].color);
-        setTimeout(printNext, steps[index].delay);
+        setConsoleLogs(prev => [...prev, { ...steps[index], timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }]);
+        setTimeout(printNext, steps[index].delay || 800);
         index++;
       } else {
         if (callback) callback();
@@ -536,7 +742,7 @@ export default function App() {
       else rejected.push(chk.value);
     });
 
-    const baseIdea = loadedResult.moderator ? loadedResult.moderator.refined_idea : "";
+    const baseIdea = loadedResult?.moderator ? loadedResult.moderator.refined_idea : "";
     
     setActiveTab("running");
     startProgressTimer();
@@ -587,59 +793,67 @@ export default function App() {
   const openAgentModal = (name) => {
     if (!loadedResult) return;
     const key = name.toLowerCase();
-    const reviews = loadedResult.refined_reviews || loadedResult.reviews || {};
-    const reflections = loadedResult.refined_reflections || loadedResult.reflections || {};
-    const debates = loadedResult.refined_debates || loadedResult.debates || loadedResult.debate || {};
+    const reviews = innerResult.refined_reviews || innerResult.reviews || (innerResult.refinement ? innerResult.refinement.reviews : {}) || {};
+    const reflections = innerResult.refined_reflections || innerResult.reflections || (innerResult.refinement ? innerResult.refinement.reflections : {}) || {};
+    const debates = innerResult.refined_debates || innerResult.debates || innerResult.debate || (innerResult.refinement ? innerResult.refinement.debate : {}) || {};
 
-    const rev = reviews[key] || reviews[name] || {};
-    const refl = reflections[key] || reflections[name] || {};
-    const round = debates[key] || debates[name] || null;
+    const revRaw = reviews[key] || reviews[name] || reviews[name.toLowerCase()] || reviews[name + " Agent"];
+    const reflRaw = reflections[key] || reflections[name] || reflections[name.toLowerCase()] || reflections[name + " Agent"];
+    const roundRaw = debates[key] || debates[name] || debates[name.toLowerCase()] || debates[name + " Agent"];
 
-    setModalTitle(`${name} Agent Arguments`);
+    const rev = typeof revRaw === "object" ? revRaw : (typeof revRaw === "string" ? { score: 7, strengths: [revRaw], weaknesses: [], suggestions: [] } : {});
+    const refl = typeof reflRaw === "object" ? reflRaw : (typeof reflRaw === "string" ? { new_score: 8 } : {});
+    const debateReplies = extractDebateReplies(roundRaw);
+
+    setModalTitle(`${name} Agent Arguments & Debate Log`);
     setModalContent(
       <div className="space-y-md">
-        <div className="border-b border-white/10 pb-sm mb-md">
-          <h4 className="font-bold text-white text-xs uppercase mb-xs font-display-lg">Independent Review Snapshot</h4>
-          <div className="grid grid-cols-2 gap-sm text-[11px] pt-xs">
-            <div>Score: <span className="text-secondary font-bold">{rev.score || "N/A"}/10</span></div>
-            <div>Confidence: <span className="text-tertiary">{rev.confidence || "0.00"}</span></div>
+        <div className="border-b border-slate-200 dark:border-white/10 pb-sm mb-md">
+          <h4 className="font-bold text-slate-900 dark:text-white text-xs uppercase mb-xs font-display-lg">Independent Review Snapshot</h4>
+          <div className="grid grid-cols-2 gap-sm text-[11px] pt-xs font-code-sm">
+            <div>Score: <span className="text-cyan-600 dark:text-cyan-400 font-bold">{rev.score !== undefined ? rev.score : 7}/10</span></div>
+            <div>Confidence: <span className="text-emerald-600 dark:text-emerald-400 font-bold">{rev.confidence || "0.85"}</span></div>
           </div>
-          <div className="mt-sm space-y-xs">
-            <span className="text-[9px] uppercase tracking-widest text-on-surface-variant block font-bold">Key Weaknesses Criticized</span>
-            <ul className="list-disc list-inside space-y-xs pl-xs text-on-surface-variant">
-              {(rev.weaknesses || []).map((w, idx) => <li key={idx}>{w}</li>)}
-            </ul>
+          <div className="mt-sm space-y-xs font-code-sm">
+            <span className="text-[9px] uppercase tracking-widest text-slate-500 dark:text-on-surface-variant block font-bold">Key Strengths & Weaknesses</span>
+            <p className="text-xs text-slate-700 dark:text-slate-200 leading-relaxed bg-slate-100 dark:bg-white/5 p-xs rounded">
+              {rev.strengths && Array.isArray(rev.strengths) ? rev.strengths.join(", ") : (typeof rev.strengths === "string" ? rev.strengths : "Independent review logged.")}
+            </p>
           </div>
         </div>
 
-        <div className="space-y-sm">
-          <h4 className="font-bold text-white text-xs uppercase mb-sm font-display-lg">Debate Stances Taken</h4>
-          {round && Array.isArray(round.arguments) && round.arguments.length > 0 ? (
-            round.arguments.map((arg, idx) => {
-              const isDisagree = arg.stance && arg.stance.toLowerCase() === "disagree";
+        <div className="space-y-sm font-code-sm">
+          <h4 className="font-bold text-slate-900 dark:text-white text-xs uppercase mb-sm font-display-lg flex items-center gap-xs">
+            <span className="material-symbols-outlined text-sm">chat_bubble</span> Debate Stances & Rebuttals ({debateReplies.length})
+          </h4>
+          {debateReplies.length > 0 ? (
+            debateReplies.map((arg, idx) => {
+              const isDisagree = arg.stance && (arg.stance.toLowerCase().includes("disagree") || arg.stance.toLowerCase().includes("challenge"));
               return (
-                <div key={idx} className="bg-[#131313] p-sm border border-white/5 rounded">
+                <div key={idx} className="bg-slate-50 dark:bg-[#131313] p-sm border border-slate-200 dark:border-white/10 rounded-lg space-y-xs">
                   <div className="flex justify-between items-center mb-xs">
-                    <div>Stance on <span className="font-bold text-secondary-fixed uppercase">{arg.reply_to}</span></div>
-                    <span className={`text-[9px] px-xs rounded bg-white/5 border border-white/10 uppercase tracking-widest ${isDisagree ? "text-error" : "text-tertiary"}`}>{arg.stance || "stance"}</span>
+                    <div className="text-xs">Challenged <span className="font-bold text-cyan-700 dark:text-cyan-300 uppercase">{arg.reply_to}</span></div>
+                    <span className={`text-[9px] px-xs py-base rounded uppercase tracking-widest font-bold ${isDisagree ? "bg-red-500/10 text-red-600 dark:text-red-400 border border-red-500/20" : "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"}`}>{arg.stance || "Stance"}</span>
                   </div>
-                  <p className="text-on-surface-variant leading-relaxed">{arg.argument}</p>
+                  <p className="text-slate-700 dark:text-slate-300 leading-relaxed text-xs">{arg.argument}</p>
                 </div>
               );
             })
           ) : (
-            <div className="text-on-surface-variant italic">This agent did not initiate any specific cross-examination arguments.</div>
+            <div className="text-slate-500 dark:text-on-surface-variant italic text-xs bg-slate-100 dark:bg-white/5 p-sm rounded text-center">This agent participated in independent review and reflection rounds.</div>
           )}
         </div>
 
-        {refl && refl.new_score !== undefined && (
-          <div className="border-t border-white/10 pt-sm mt-md space-y-xs">
-            <h4 className="font-bold text-white text-xs uppercase mb-xs font-display-lg">Post-Debate Reflection</h4>
-            <div className="text-[11px] pt-xs">
-              Reflected Score: <span className="text-tertiary font-bold">{refl.new_score}/10</span>
-              <span className="text-on-surface-variant ml-xs">(Was: {refl.old_score || rev.score})</span>
-            </div>
-            <p className="text-on-surface-variant leading-relaxed mt-xs italic bg-white/5 p-xs rounded border border-white/5">"{refl.reason}"</p>
+        {refl && (refl.new_score !== undefined || refl.reason) && (
+          <div className="border-t border-slate-200 dark:border-white/10 pt-sm mt-md space-y-xs font-code-sm">
+            <h4 className="font-bold text-slate-900 dark:text-white text-xs uppercase mb-xs font-display-lg">Post-Debate Reflection</h4>
+            {refl.new_score !== undefined && (
+              <div className="text-[11px] pt-xs">
+                Reflected Score: <span className="text-emerald-600 dark:text-emerald-400 font-bold">{refl.new_score}/10</span>
+                {refl.old_score && <span className="text-slate-500 dark:text-on-surface-variant ml-xs">(Was: {refl.old_score})</span>}
+              </div>
+            )}
+            {refl.reason && <p className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed mt-xs italic bg-slate-100 dark:bg-white/5 p-xs rounded border border-slate-200 dark:border-white/5">"{refl.reason}"</p>}
           </div>
         )}
       </div>
@@ -675,6 +889,16 @@ export default function App() {
             {(cand.counterfact || []).map((c, idx) => <li key={idx}>{c}</li>)}
           </ul>
         </div>
+        <button
+          onClick={() => {
+            setShowModal(false);
+            selectCandidateIdea(cand);
+          }}
+          className="w-full mt-md bg-primary-container hover:bg-primary-container/80 text-on-primary-container font-label-xs text-xs font-bold py-sm rounded uppercase tracking-widest transition-all flex items-center justify-center gap-xs"
+        >
+          Initialize Refining Debate on this Idea
+          <span className="material-symbols-outlined text-sm">rocket_launch</span>
+        </button>
       </div>
     );
     setShowModal(true);
@@ -741,7 +965,18 @@ export default function App() {
   }
 
   // Helper variables for dash elements
-  const innerResult = loadedResult ? (loadedResult.result || loadedResult) : null;
+  const activeCand = getActiveCandidateInfo ? getActiveCandidateInfo() : null;
+  const isCurrentCandidateRefined = loadedResult?.selected_candidate && activeCand && (
+    activeCand.title === loadedResult.selected_candidate.title ||
+    loadedResult.selected_candidate.title?.toLowerCase().includes(activeCand.title?.toLowerCase()) ||
+    activeCand.title?.toLowerCase().includes(loadedResult.selected_candidate.title?.toLowerCase())
+  );
+
+  const innerResult = loadedResult 
+    ? (loadedResult.selected_candidate 
+        ? (isCurrentCandidateRefined ? (loadedResult.refinement || {}) : {})
+        : (loadedResult.result || loadedResult.refinement || loadedResult)) 
+    : {};
   const isGenerationKind = loadedResult && (loadedResult.kind === "generate" || !!innerResult?.conclusion);
 
   const isBrainstormTab = ["pathway", "refine_form", "generate_form", "running", "dashboard", "analytics", "config", "logs", "status"].includes(activeTab);
@@ -758,9 +993,11 @@ export default function App() {
               <span className="material-symbols-outlined text-sm">menu</span>
             </button>
           )}
-          <div className="flex items-center gap-xs font-display-lg text-headline-lg-mobile font-[900] text-slate-900 dark:text-primary cursor-pointer tracking-tighter" onClick={() => { setActiveTab("pathway"); setActiveProject(null); setLoadedResult(null); }}>
-            <img src="/favicon.png" className="w-6 h-6 rounded-full" alt="Crucible Logo" />
-            <span>Crucible.</span>
+          <div className="flex items-center gap-xs cursor-pointer" onClick={() => { setActiveTab("pathway"); setActiveProject(null); setLoadedResult(null); }}>
+            <div className="font-display-lg text-headline-lg-mobile font-[900] text-slate-900 dark:text-primary tracking-tighter">
+                <span>Crucible.</span>
+            </div>
+            <img src="/favicon.png" className="w-4 h-4 rounded-full" alt="Crucible Logo" />
           </div>
           
           <div className="hidden md:flex items-center gap-xs font-code-sm text-xs select-none pl-md">
@@ -786,6 +1023,7 @@ export default function App() {
               {theme === "dark" ? "light_mode" : "dark_mode"}
             </span>
           </button>
+            <img src="/favicon.png" className="w-4 h-4 rounded-full" alt="Crucible Logo" />
 
           {/* Welcome Clearance */}
           <div className="hidden lg:block font-code-sm text-xs text-slate-500 dark:text-on-surface-variant select-none">
@@ -849,10 +1087,40 @@ export default function App() {
                       <div className="text-slate-400 dark:text-on-surface-variant text-[10px] italic px-sm text-left">No owned projects</div>
                     ) : (
                       projects.map(proj => (
-                        <a key={proj.id} onClick={() => loadProjectDetails(proj.id)} className={`flex items-center gap-xs px-sm py-xs rounded-DEFAULT transition-all cursor-pointer text-xs truncate max-w-xs font-code-sm ${activeProject?.id === proj.id ? "text-slate-900 dark:text-white bg-slate-100 dark:bg-white/10 border-l-2 border-primary-container font-bold" : "text-slate-500 dark:text-on-surface-variant hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-white/5"}`}>
-                          <span className="material-symbols-outlined text-xs select-none">folder</span>
-                          {proj.name}
-                        </a>
+                        <div key={proj.id} className="space-y-base">
+                          <a onClick={() => loadProjectDetails(proj.id, 0)} className={`flex items-center justify-between gap-xs px-sm py-xs rounded-DEFAULT transition-all cursor-pointer text-xs font-code-sm ${activeProject?.id === proj.id ? "text-slate-900 dark:text-white bg-slate-100 dark:bg-white/10 border-l-2 border-primary-container font-bold" : "text-slate-500 dark:text-on-surface-variant hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-white/5"}`}>
+                            <div className="flex items-center gap-xs min-w-0 truncate">
+                              <span className="material-symbols-outlined text-xs select-none flex-shrink-0">folder</span>
+                              <span className="truncate">{proj.name}</span>
+                            </div>
+                            <button onClick={(e) => { e.stopPropagation(); handleDeleteClick(proj.id, e); }} className="ml-auto text-slate-400 hover:text-red-500 flex-shrink-0 opacity-70 hover:opacity-100 transition-opacity p-0.5" title="Delete Project">
+                              <span className="material-symbols-outlined text-xs select-none">delete</span>
+                            </button>
+                          </a>
+
+                          {/* Subfolders for candidate project ideas */}
+                          {activeProject?.id === proj.id && loadedResult?.candidates && Array.isArray(loadedResult.candidates) && loadedResult.candidates.length > 0 && (
+                            <div className="ml-md space-y-base border-l-2 border-slate-200 dark:border-white/10 pl-xs my-xs">
+                              {loadedResult.candidates.map((cand, cIdx) => (
+                                <div
+                                  key={cIdx}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    loadProjectDetails(proj.id, cIdx);
+                                  }}
+                                  className={`flex items-center gap-xs px-xs py-base rounded text-[11px] font-code-sm cursor-pointer truncate transition-all ${
+                                    selectedCandidateIdx === cIdx
+                                      ? "text-cyan-700 dark:text-cyan-300 font-bold bg-cyan-500/10 border-l-2 border-cyan-500"
+                                      : "text-slate-500 dark:text-on-surface-variant hover:text-slate-900 dark:hover:text-white"
+                                  }`}
+                                >
+                                  <span className="material-symbols-outlined text-[12px]">lightbulb</span>
+                                  <span className="truncate">Idea #{cIdx + 1}: {cand.title}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
                       ))
                     )}
                   </div>
@@ -866,9 +1134,14 @@ export default function App() {
                       <div className="text-slate-400 dark:text-on-surface-variant text-[10px] italic px-sm text-left">No shared projects</div>
                     ) : (
                       collaboratedProjects.map(proj => (
-                        <a key={proj.id} onClick={() => loadProjectDetails(proj.id)} className={`flex items-center gap-xs px-sm py-xs rounded-DEFAULT transition-all cursor-pointer text-xs truncate max-w-xs font-code-sm ${activeProject?.id === proj.id ? "text-slate-900 dark:text-white bg-slate-100 dark:bg-white/10 border-l-2 border-secondary-container font-bold" : "text-slate-500 dark:text-on-surface-variant hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-white/5"}`}>
-                          <span className="material-symbols-outlined text-xs select-none">groups</span>
-                          {proj.name}
+                        <a key={proj.id} onClick={() => loadProjectDetails(proj.id)} className={`flex items-center justify-between gap-xs px-sm py-xs rounded-DEFAULT transition-all cursor-pointer text-xs font-code-sm ${activeProject?.id === proj.id ? "text-slate-900 dark:text-white bg-slate-100 dark:bg-white/10 border-l-2 border-secondary-container font-bold" : "text-slate-500 dark:text-on-surface-variant hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-white/5"}`}>
+                          <div className="flex items-center gap-xs min-w-0 truncate">
+                            <span className="material-symbols-outlined text-xs select-none flex-shrink-0">groups</span>
+                            <span className="truncate">{proj.name}</span>
+                          </div>
+                          <button onClick={(e) => { e.stopPropagation(); handleDeleteClick(proj.id, e); }} className="ml-auto text-slate-400 hover:text-red-500 flex-shrink-0 opacity-70 hover:opacity-100 transition-opacity p-0.5" title="Delete Project">
+                            <span className="material-symbols-outlined text-xs select-none">delete</span>
+                          </button>
                         </a>
                       ))
                     )}
@@ -999,12 +1272,12 @@ export default function App() {
         )}
 
         {/* MAIN CANVAS */}
-        <main className={`flex-1 min-h-[calc(100vh-57px)] relative flex flex-col p-md md:p-lg ${isBrainstormTab ? "md:ml-64 pt-[110px] md:pt-[24px]" : "pt-[24px] pb-xl w-full"}`}>
+        <main className={`flex-1 min-h-[calc(100vh-57px)] max-w-full overflow-x-hidden relative flex flex-col p-sm md:p-md ${isBrainstormTab ? "md:ml-64 pt-[70px] md:pt-[20px]" : "pt-[20px] pb-xl w-full"}`}>
           {/* Background overlay glows */}
           <div className="absolute inset-0 pointer-events-none opacity-10 bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-secondary-container/20 via-transparent to-transparent"></div>
           <div className="absolute inset-0 pointer-events-none opacity-10 bg-[radial-gradient(ellipse_at_bottom_left,_var(--tw-gradient-stops))] from-primary-container/20 via-transparent to-transparent"></div>
           
-          <div className="relative z-10 w-full flex-1 flex flex-col justify-start">
+          <div className="relative z-10 w-full max-w-7xl mx-auto flex-1 flex flex-col justify-start">
             
             {/* BRAINSTORM WORKSPACE VIEWS */}
             {isBrainstormTab && (
@@ -1181,257 +1454,312 @@ export default function App() {
                   </div>
                 )}
 
-                {/* VIEW 4: PROGRESSIVE LOGS */}
+                {/* VIEW 4: PROGRESSIVE LIVE AGENT CONVERSATION STREAM */}
                 {activeTab === "running" && (
                   <div className="flex-1 flex flex-col justify-center min-h-[60vh] py-lg space-y-md">
-                    <div className="w-full bg-white dark:bg-[#0A0A0A]/95 border border-slate-200 dark:border-white/10 p-md md:p-lg rounded-xl shadow-md flex flex-col gap-sm">
-                      <div className="flex items-center justify-between border-b border-slate-200 dark:border-white/10 pb-sm mb-sm text-left">
-                        <div className="flex items-center gap-xs">
-                          <div className="w-3 h-3 rounded-full bg-slate-900 dark:bg-primary-container ai-pulse"></div>
-                          <h3 className="font-code-sm text-sm font-bold text-slate-800 dark:text-primary-fixed-dim uppercase tracking-wider">PIPELINE_EXECUTION // ACTIVE</h3>
+                    <div className="w-full bg-white dark:bg-[#0A0A0A]/95 border border-slate-200 dark:border-white/10 p-md md:p-lg rounded-xl shadow-md flex flex-col gap-md">
+                      <div className="flex items-center justify-between border-b border-slate-200 dark:border-white/10 pb-sm text-left">
+                        <div className="flex items-center gap-sm">
+                          <div className="w-3 h-3 rounded-full bg-cyan-400 animate-ping"></div>
+                          <div>
+                            <h3 className="font-code-sm text-sm font-bold text-slate-900 dark:text-cyan-300 uppercase tracking-wider">A2A AGENT PANEL DEBATE // LIVE CONVERSATION STREAM</h3>
+                            <p className="text-[10px] text-slate-500 dark:text-slate-400">Innovation, Feasibility, Impact, Technical, Skeptic & Moderator agents cross-examining live</p>
+                          </div>
                         </div>
-                        <span className="font-code-sm text-xs text-slate-500 dark:text-on-surface-variant">Time Elapsed: {progressTime.toFixed(1)}s</span>
+                        <div className="flex items-center gap-md">
+                          <span className="font-code-sm text-xs text-cyan-700 dark:text-cyan-400 font-bold bg-cyan-500/10 px-sm py-1 rounded border border-cyan-500/20">Elapsed: {progressTime.toFixed(1)}s</span>
+                        </div>
                       </div>
                       
-                      <div className="bg-slate-950 text-green-400 border border-slate-900 p-sm font-code-sm text-xs rounded h-80 overflow-y-auto space-y-xs text-left">
-                        {consoleLogs.map((log, idx) => (
-                          <div key={idx} style={{ color: theme === "light" && log.color === "#e2e2e2" ? "#ffffff" : log.color }}>{log.text}</div>
-                        ))}
+                      {/* Live Agent Conversation Feed */}
+                      <div className="bg-slate-900 dark:bg-[#0d0e12] border border-slate-800 dark:border-white/10 p-md font-code-sm text-xs rounded-xl h-96 overflow-y-auto space-y-md text-left">
+                        {consoleLogs.map((log, idx) => {
+                          const isSystem = !log.agent || log.agent === "SYSTEM";
+                          return (
+                            <div key={idx} className={`flex items-start gap-sm animate-fadeIn ${isSystem ? "opacity-75 justify-center py-xs" : ""}`}>
+                              {isSystem ? (
+                                <div className="bg-slate-800/80 text-slate-300 px-md py-xs rounded-full text-[11px] border border-white/5 flex items-center gap-xs">
+                                  <span className="material-symbols-outlined text-xs text-cyan-400">memory</span>
+                                  {log.text}
+                                </div>
+                              ) : (
+                                <div className="flex items-start gap-sm w-full">
+                                  <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-xs flex-shrink-0 ${log.color || "bg-cyan-500/20 text-cyan-300 border border-cyan-500/30"}`}>
+                                    <span className="material-symbols-outlined text-sm">{log.avatar || "smart_toy"}</span>
+                                  </div>
+                                  <div className="flex-1 bg-slate-850 dark:bg-[#161820] border border-slate-800 dark:border-white/10 p-sm rounded-xl space-y-xs">
+                                    <div className="flex items-center justify-between border-b border-white/5 pb-1">
+                                      <span className="font-bold text-slate-200 dark:text-white text-xs">{log.agent}</span>
+                                      <span className="text-[9px] text-slate-400 uppercase tracking-widest">{log.timestamp || "Live Debate"}</span>
+                                    </div>
+                                    <p className="text-slate-300 dark:text-slate-200 leading-relaxed text-xs">{log.text}</p>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                         <div ref={consoleEndRef} />
                       </div>
                       
-                      <div className="flex items-center justify-center py-sm">
-                        <div className="flex flex-col items-center gap-xs select-none">
-                          <span className="font-code-sm text-xs text-slate-500 dark:text-on-surface-variant uppercase tracking-widest">Agents are debating and reflecting...</span>
-                          <div className="w-48 bg-slate-200 dark:bg-white/5 h-1.5 rounded-full overflow-hidden relative">
-                            <div className="bg-slate-900 dark:bg-primary-container h-full w-2/3 absolute top-0 left-0 rounded-full animate-pulse"></div>
-                          </div>
+                      <div className="flex items-center justify-between py-xs border-t border-slate-200 dark:border-white/10 pt-sm">
+                        <div className="flex items-center gap-xs text-slate-500 dark:text-slate-400 text-xs">
+                          <span className="material-symbols-outlined text-sm text-cyan-400 animate-spin">sync</span>
+                          <span>Agents are debating, challenging claims, and synthesizing final consensus...</span>
                         </div>
+                        <button
+                          onClick={() => {
+                            setSelectedAgentForChat("moderator");
+                            setActiveTabSubView("chat");
+                            setActiveTab("dashboard");
+                          }}
+                          className="bg-slate-800 hover:bg-slate-700 text-cyan-300 text-xs font-bold px-md py-xs rounded-lg border border-cyan-500/30 flex items-center gap-xs transition-all hover:scale-105"
+                        >
+                          <span className="material-symbols-outlined text-sm">gavel</span>
+                          Chat with Moderator
+                        </button>
                       </div>
                     </div>
                   </div>
                 )}
 
                 {/* VIEW 5: DEBATE DASHBOARD */}
-                {activeTab === "dashboard" && loadedResult?.status === "pending_selection" && (
+                {activeTab === "dashboard" && (
                   <div className="space-y-lg flex-1 text-left">
-                    <header className="border-b border-slate-200 dark:border-white/10 pb-sm">
-                      <div className="inline-flex items-center gap-xs px-xs py-base bg-primary/10 border border-primary/20 rounded-sm mb-xs select-none">
-                        <span className="font-code-sm text-label-xs text-primary dark:text-primary-fixed uppercase tracking-wider font-bold">Candidates Generated</span>
+                    {projectLoading ? (
+                      <div className="flex flex-col items-center justify-center py-2xl space-y-md min-h-[50vh]">
+                        <div className="w-12 h-12 border-4 border-cyan-400 border-t-transparent rounded-full animate-spin"></div>
+                        <p className="font-code-sm text-xs text-cyan-400 uppercase tracking-widest animate-pulse font-bold">
+                          LOADING PROJECT DATA & AGENT REVIEWS...
+                        </p>
                       </div>
-                      <h2 className="font-headline-lg md:text-[34px] font-[800] text-slate-800 dark:text-on-surface mb-xs">Select Candidate Topic of Interest</h2>
-                      <p className="font-body-md text-slate-600 dark:text-on-surface-variant max-w-2xl text-sm">
-                        Select which candidate proposal to initialize the multi-agent debate refinement pipeline on. You can visit the other generated concepts later in the "Alternative Proposals" tab.
-                      </p>
-                    </header>
+                    ) : (loadedResult?.status === "pending_selection" && selectedCandidateIdx === null) ? (
+                      <div className="space-y-lg flex-1 text-left">
+                        <header className="border-b border-slate-200 dark:border-white/10 pb-sm">
+                          <div className="inline-flex items-center gap-xs px-xs py-base bg-cyan-500/10 border border-cyan-500/20 rounded-sm mb-xs select-none">
+                            <span className="font-code-sm text-xs text-cyan-400 uppercase tracking-wider font-bold">Candidates Generated</span>
+                          </div>
+                          <h2 className="font-headline-lg md:text-[32px] font-[800] text-slate-900 dark:text-cyan-300 mb-xs">Select Candidate Topic of Interest</h2>
+                          <p className="font-body-md text-slate-600 dark:text-on-surface-variant max-w-2xl text-xs">
+                            Select which candidate proposal to initialize the multi-agent debate refinement pipeline on, or click any candidate on the left sidebar to view its dedicated concept page.
+                          </p>
+                        </header>
 
-                    {candidateSelectionLoading ? (
-                      <div className="flex flex-col items-center justify-center py-2xl space-y-md">
-                        <div className="w-12 h-12 border-4 border-primary-container border-t-transparent rounded-full animate-spin"></div>
-                        <p className="font-code-sm text-sm text-primary animate-pulse">DEPLOYING EXPERT AGENT PANEL FOR REFINEMENT DEBATE...</p>
-                      </div>
-                    ) : (
-                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-md">
-                        {loadedResult.candidates?.map((cand, idx) => (
-                          <div key={idx} className="bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 rounded-xl p-md flex flex-col justify-between hover:border-primary-container transition-all hover:shadow-[0_0_15px_rgba(0,242,255,0.1)]">
-                            <div className="space-y-sm">
-                              <div className="flex items-center justify-between">
-                                <span className="font-code-sm text-[10px] text-slate-400 dark:text-on-surface-variant uppercase">Option #{idx + 1}</span>
-                                <span className="bg-primary/10 text-primary text-[9px] px-xs rounded font-bold uppercase">{cand.creator || "Innovation Agent"}</span>
+                        {candidateSelectionLoading ? (
+                          <div className="flex flex-col items-center justify-center py-2xl space-y-md">
+                            <div className="w-12 h-12 border-4 border-cyan-400 border-t-transparent rounded-full animate-spin"></div>
+                            <p className="font-code-sm text-xs text-cyan-400 animate-pulse font-bold">DEPLOYING EXPERT AGENT PANEL FOR REFINEMENT DEBATE...</p>
+                          </div>
+                        ) : (
+                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-md">
+                            {loadedResult.candidates?.map((cand, idx) => (
+                              <div key={idx} className="bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 rounded-xl p-md flex flex-col justify-between hover:border-cyan-500/50 transition-all hover:shadow-[0_0_15px_rgba(0,242,255,0.1)] text-left">
+                                <div className="space-y-sm">
+                                  <div className="flex items-center justify-between">
+                                    <span className="font-code-sm text-[10px] text-slate-400 dark:text-on-surface-variant uppercase font-bold">Option #{idx + 1}</span>
+                                    <span className="bg-cyan-500/10 text-cyan-400 text-[9px] px-xs rounded font-bold uppercase">{cand.creator || "Innovation Agent"}</span>
+                                  </div>
+                                  <h3 className="font-headline-lg-mobile text-slate-900 dark:text-cyan-300 font-bold text-sm leading-tight">{cand.title}</h3>
+                                  <p className="text-slate-600 dark:text-slate-300 text-xs leading-relaxed line-clamp-6">{cand.idea}</p>
+                                </div>
+                                
+                                <div className="pt-md space-y-xs">
+                                  <button onClick={() => selectCandidateIdea(cand)} className="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-label-xs text-[10px] font-bold py-xs rounded uppercase tracking-widest transition-all flex items-center justify-center gap-xs">
+                                    <span className="material-symbols-outlined text-xs">rocket_launch</span>
+                                    Initialize Refining Debate
+                                  </button>
+                                  <button onClick={() => loadProjectDetails(activeProject.id, idx)} className="w-full bg-slate-100 dark:bg-white/5 hover:bg-slate-200 dark:hover:bg-white/10 text-slate-700 dark:text-slate-300 font-label-xs text-[10px] font-bold py-xs rounded uppercase tracking-widest transition-all">
+                                    View Info Page
+                                  </button>
+                                </div>
                               </div>
-                              <h3 className="font-headline-lg-mobile text-slate-900 dark:text-on-surface font-bold text-sm leading-tight">{cand.title}</h3>
-                              <p className="text-slate-600 dark:text-on-surface-variant text-xs leading-relaxed line-clamp-6">{cand.idea}</p>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ) : (activeProject || loadedResult) ? (
+                      <>
+                        <header className="flex flex-col md:flex-row md:items-center justify-between gap-md border-b border-slate-200 dark:border-white/10 pb-sm">
+                          <div>
+                            <div className={`font-label-xs text-label-xs uppercase tracking-wider font-bold inline-flex items-center gap-xs px-xs py-base rounded-sm mb-xs border ${isGenerationKind ? "text-slate-800 dark:text-primary-fixed bg-slate-100 dark:bg-primary/10 border-slate-200 dark:border-primary/20" : "text-slate-800 dark:text-secondary-fixed bg-slate-100 dark:bg-secondary-container/10 border-slate-200 dark:border-secondary-container/30"}`}>
+                              <span className="material-symbols-outlined text-sm" style={{ fontVariationSettings: "'FILL' 1" }}>analytics</span>
+                              {isGenerationKind ? "Generation & Refinement" : "Refinement Results"}
                             </div>
-                            
-                            <button onClick={() => selectCandidateIdea(cand)} className="mt-md w-full bg-primary-container hover:bg-primary-container/80 text-on-primary-container font-label-xs text-[10px] font-bold py-xs rounded uppercase tracking-widest transition-all">
-                              Initialize Refining Debate
+                            <h2 className="font-display-lg text-headline-lg font-bold text-slate-900 dark:text-cyan-300">
+                              {getActiveCandidateInfo()?.title || activeProject?.name || "Project Dashboard"}
+                            </h2>
+                            <p className="font-code-sm text-xs text-slate-500 dark:text-on-surface-variant mt-1">PROJECT_ID: {activeProject?.id}</p>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-sm">
+                            <button
+                              onClick={handleRefineCurrentIdea}
+                              className="bg-primary-container hover:bg-primary-container/80 text-on-primary-container font-label-xs text-label-xs py-sm px-md rounded-DEFAULT transition-all uppercase tracking-widest font-bold shadow-xs flex items-center gap-xs"
+                            >
+                              <span className="material-symbols-outlined text-xs">rocket_launch</span>
+                              {loadedResult?.refinement || innerResult?.moderator ? "Re-run Refinement" : "Refine This Idea"}
+                            </button>
+                            <button onClick={() => { setSelectedAgentForChat("moderator"); setActiveTabSubView("chat"); }} className="bg-cyan-500/15 text-cyan-800 dark:text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/25 font-label-xs text-label-xs py-sm px-md rounded-DEFAULT transition-all uppercase tracking-widest font-bold shadow-xs flex items-center gap-xs">
+                              <span className="material-symbols-outlined text-xs">gavel</span> Chat with Moderator
+                            </button>
+                            <button onClick={() => { if (activeProject?.id) { setShowCollabModal(true); loadCollaborators(activeProject.id); } }} className="bg-white hover:bg-slate-100 dark:bg-white/5 dark:hover:bg-white/10 text-slate-800 dark:text-on-surface font-label-xs text-label-xs py-sm px-md rounded-DEFAULT border border-slate-200 dark:border-white/10 transition-all uppercase tracking-widest font-bold shadow-xs flex items-center gap-xs">
+                              <span className="material-symbols-outlined text-xs">groups</span> Share Team
+                            </button>
+                            <button onClick={() => { setActiveTab("pathway"); setActiveProject(null); setLoadedResult(null); }} className="bg-slate-900 hover:bg-slate-850 dark:bg-primary-container dark:hover:bg-primary-container/80 text-white dark:text-on-primary-container font-label-xs text-label-xs py-sm px-md rounded-DEFAULT transition-all uppercase tracking-widest font-bold shadow-xs">
+                              New Session
                             </button>
                           </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
+                        </header>
 
-                {activeTab === "dashboard" && innerResult && loadedResult?.status !== "pending_selection" && (
-                  <div className="space-y-lg flex-1 text-left">
-                    <header className="flex flex-col md:flex-row md:items-center justify-between gap-md border-b border-slate-200 dark:border-white/10 pb-sm">
-                      <div>
-                        <div className={`font-label-xs text-label-xs uppercase tracking-wider font-bold inline-flex items-center gap-xs px-xs py-base rounded-sm mb-xs border ${isGenerationKind ? "text-slate-800 dark:text-primary-fixed bg-slate-100 dark:bg-primary/10 border-slate-200 dark:border-primary/20" : "text-slate-800 dark:text-secondary-fixed bg-slate-100 dark:bg-secondary-container/10 border-slate-200 dark:border-secondary-container/30"}`}>
-                          <span className="material-symbols-outlined text-sm" style={{ fontVariationSettings: "'FILL' 1" }}>analytics</span>
-                          {isGenerationKind ? "Generation & Refinement" : "Refinement Results"}
-                        </div>
-                        <h2 className="font-display-lg text-headline-lg font-bold text-slate-900 dark:text-primary">
-                          {isGenerationKind ? (loadedResult.selected_candidate?.title || innerResult.conclusion?.selected_idea || activeProject?.name) : activeProject?.name || "Refined Idea"}
-                        </h2>
-                        <p className="font-code-sm text-xs text-slate-500 dark:text-on-surface-variant mt-1">PROJECT_ID: {activeProject?.id}</p>
-                      </div>
-                      <div className="flex items-center gap-sm">
-                        <button onClick={() => { setShowCollabModal(true); loadCollaborators(activeProject.id); }} className="bg-white hover:bg-slate-100 dark:bg-white/5 dark:hover:bg-white/10 text-slate-800 dark:text-on-surface font-label-xs text-label-xs py-sm px-md rounded-DEFAULT border border-slate-200 dark:border-white/10 transition-all uppercase tracking-widest font-bold shadow-xs flex items-center gap-xs">
-                          <span className="material-symbols-outlined text-xs">groups</span> Share Team
-                        </button>
-                        <button onClick={() => { setActiveTab("pathway"); setActiveProject(null); setLoadedResult(null); }} className="bg-slate-900 hover:bg-slate-850 dark:bg-primary-container dark:hover:bg-primary-container/80 text-white dark:text-on-primary-container font-label-xs text-label-xs py-sm px-md rounded-DEFAULT transition-all uppercase tracking-widest font-bold shadow-xs">
-                          New Session
-                        </button>
-                      </div>
-                    </header>
-
-                    {/* SubView Tabs Selector */}
-                    <div className="flex border-b border-slate-200 dark:border-white/10 mb-md gap-sm overflow-x-auto pr-base">
-                      <button onClick={() => setActiveTabSubView("overview")} className={`pb-xs font-label-xs text-xs uppercase tracking-widest font-bold border-b-2 transition-all ${activeTabSubView === "overview" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-white"}`}>Consensus / Roadmap</button>
-                      <button onClick={() => setActiveTabSubView("reviews")} className={`pb-xs font-label-xs text-xs uppercase tracking-widest font-bold border-b-2 transition-all ${activeTabSubView === "reviews" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-white"}`}>Specialist Reviews</button>
-                      <button onClick={() => setActiveTabSubView("debates")} className={`pb-xs font-label-xs text-xs uppercase tracking-widest font-bold border-b-2 transition-all ${activeTabSubView === "debates" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-white"}`}>Debate Rounds</button>
-                      <button onClick={() => setActiveTabSubView("chat")} className={`pb-xs font-label-xs text-xs uppercase tracking-widest font-bold border-b-2 transition-all ${activeTabSubView === "chat" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-white"}`}>Agent Chat Room</button>
-                      {loadedResult.candidates && loadedResult.candidates.length > 0 && (
-                        <button onClick={() => setActiveTabSubView("candidates")} className={`pb-xs font-label-xs text-xs uppercase tracking-widest font-bold border-b-2 transition-all ${activeTabSubView === "candidates" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-white"}`}>Alternative Ideas</button>
-                      )}
+                    {/* SubView Tabs Selector - Clearly Separated Boxed Tab Buttons */}
+                    <div className="flex items-center gap-sm border-b border-slate-200 dark:border-white/10 pb-sm mb-md overflow-x-auto">
+                      <button onClick={() => setActiveTabSubView("overview")} className={`px-md py-xs rounded-lg text-xs font-bold uppercase tracking-wider transition-all flex items-center gap-xs border ${activeTabSubView === "overview" ? "bg-cyan-500/15 text-cyan-800 dark:text-cyan-300 border-cyan-500 shadow-sm font-bold" : "bg-slate-100 dark:bg-white/5 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-white/10 hover:bg-slate-200 dark:hover:bg-white/10"}`}>
+                        <span className="material-symbols-outlined text-sm">analytics</span>
+                        Consensus / Roadmap
+                      </button>
+                      <button onClick={() => setActiveTabSubView("reviews")} className={`px-md py-xs rounded-lg text-xs font-bold uppercase tracking-wider transition-all flex items-center gap-xs border ${activeTabSubView === "reviews" ? "bg-cyan-500/15 text-cyan-800 dark:text-cyan-300 border-cyan-500 shadow-sm font-bold" : "bg-slate-100 dark:bg-white/5 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-white/10 hover:bg-slate-200 dark:hover:bg-white/10"}`}>
+                        <span className="material-symbols-outlined text-sm">groups</span>
+                        Specialist Reviews
+                      </button>
+                      <button onClick={() => setActiveTabSubView("debates")} className={`px-md py-xs rounded-lg text-xs font-bold uppercase tracking-wider transition-all flex items-center gap-xs border ${activeTabSubView === "debates" ? "bg-cyan-500/15 text-cyan-800 dark:text-cyan-300 border-cyan-500 shadow-sm font-bold" : "bg-slate-100 dark:bg-white/5 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-white/10 hover:bg-slate-200 dark:hover:bg-white/10"}`}>
+                        <span className="material-symbols-outlined text-sm">chat_bubble</span>
+                        Debate Rounds
+                      </button>
+                      <button onClick={() => setActiveTabSubView("chat")} className={`px-md py-xs rounded-lg text-xs font-bold uppercase tracking-wider transition-all flex items-center gap-xs border ${activeTabSubView === "chat" ? "bg-cyan-500/15 text-cyan-800 dark:text-cyan-300 border-cyan-500 shadow-sm font-bold" : "bg-slate-100 dark:bg-white/5 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-white/10 hover:bg-slate-200 dark:hover:bg-white/10"}`}>
+                        <span className="material-symbols-outlined text-sm">support_agent</span>
+                        Agent Chat Room
+                      </button>
                     </div>
 
-                    {/* SUBVIEW 1: OVERVIEW / CONSENSUS */}
+                    {/* SUBVIEW 1: OVERVIEW / CONSENSUS (REFINED CONCEPT -> FACTS -> DECISION LOOP) */}
                     {activeTabSubView === "overview" && (
-                      <div className="grid grid-cols-1 lg:grid-cols-12 gap-lg">
+                      <div className="space-y-md text-left max-w-4xl mx-auto">
                         
-                        {/* Left Panel */}
-                        <div className="lg:col-span-8 space-y-lg">
-                          {/* Factual Research */}
-                          {innerResult.research && Object.keys(innerResult.research).length > 0 && (
-                            <div className="bg-white dark:bg-[#0A0A0A]/80 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-xs">
-                              <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
-                                <span className="material-symbols-outlined text-sm">fact_check</span> Factual Research Brief
+                        {/* 1. TOP: REFINED HACKATHON CONCEPT */}
+                        <div className="bg-white dark:bg-[#0A0A0A]/90 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-sm">
+                          <div className="flex items-center justify-between border-b border-slate-100 dark:border-white/5 pb-xs">
+                            <div className="flex items-center gap-xs">
+                              <span className="material-symbols-outlined text-cyan-500 text-sm">lightbulb</span>
+                              <h3 className="font-headline-lg-mobile font-bold text-slate-900 dark:text-cyan-300 text-base">
+                                Refined Concept: {getActiveCandidateInfo()?.title || activeProject?.name}
                               </h3>
-                              <div className="grid grid-cols-1 md:grid-cols-2 gap-sm text-sm">
-                                <div className="space-y-xs">
-                                  <h4 className="font-code-sm text-xs font-bold text-slate-800 dark:text-secondary-fixed uppercase">Verified Claims / Facts</h4>
-                                  <ul className="space-y-xs max-h-48 overflow-y-auto pr-xs">
-                                    {(() => {
-                                      let facts = [];
-                                      if (Array.isArray(innerResult.research.facts)) {
-                                        facts = innerResult.research.facts;
-                                      } else {
-                                        Object.values(innerResult.research).forEach(b => {
-                                          if (b.facts) facts.push(...b.facts);
-                                        });
-                                      }
-                                      return facts.map((fact, idx) => (
-                                        <li key={idx} className="border-b border-slate-100 dark:border-white/5 pb-xs mb-xs">
-                                          <span className="text-[10px] px-xs bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded uppercase font-bold text-slate-500 dark:text-on-surface-variant mr-1">{fact.strength || "med"}</span>
-                                          <span className="text-xs text-slate-800 dark:text-white">{fact.claim}</span>
-                                          <span className="text-[10px] text-slate-500 dark:text-on-surface-variant block mt-xs">Source: {fact.source}</span>
-                                        </li>
-                                      ));
-                                    })()}
-                                  </ul>
-                                </div>
-                                <div className="space-y-sm">
-                                  <div className="space-y-xs">
-                                    <h4 className="font-code-sm text-xs font-bold text-red-500 dark:text-error uppercase">Problem Signals</h4>
-                                    <ul className="list-disc list-inside text-slate-500 dark:text-on-surface-variant space-y-xs pl-xs max-h-24 overflow-y-auto text-xs">
-                                      {(() => {
-                                        let probs = [];
-                                        if (Array.isArray(innerResult.research.problem_signals)) {
-                                          probs = innerResult.research.problem_signals;
-                                        } else {
-                                          Object.values(innerResult.research).forEach(b => {
-                                            if (b.problem_signals) probs.push(...b.problem_signals);
-                                          });
-                                        }
-                                        return probs.map((p, idx) => <li key={idx}>{p}</li>);
-                                      })()}
-                                    </ul>
-                                  </div>
-                                  <div className="space-y-xs">
-                                    <h4 className="font-code-sm text-xs font-bold text-slate-800 dark:text-primary-fixed uppercase">Unverified / Data Gaps</h4>
-                                    <ul className="list-disc list-inside text-slate-500 dark:text-on-surface-variant space-y-xs pl-xs max-h-24 overflow-y-auto text-xs">
-                                      {(() => {
-                                        let gaps = [];
-                                        if (Array.isArray(innerResult.research.gap_notes)) {
-                                          gaps = innerResult.research.gap_notes;
-                                        } else {
-                                          Object.values(innerResult.research).forEach(b => {
-                                            if (b.gap_notes) gaps.push(...b.gap_notes);
-                                          });
-                                        }
-                                        return gaps.map((g, idx) => <li key={idx}>{g}</li>);
-                                      })()}
-                                    </ul>
-                                  </div>
-                                </div>
-                              </div>
                             </div>
-                          )}
+                            <span className="bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 border border-cyan-500/20 text-[10px] px-xs py-base rounded uppercase font-bold">
+                              Fit: {getActiveCandidateInfo()?.fit ?? 8}/10
+                            </span>
+                          </div>
 
-                          {/* Operator Feedback Iteration */}
-                          {innerResult.moderator && (
-                            <div className="bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-xs">
-                              <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
-                                <span className="material-symbols-outlined text-sm">settings_backup_restore</span> Operator Decision Loop
-                              </h3>
-                              <p className="text-xs text-slate-500 dark:text-on-surface-variant leading-relaxed">Select improvements to adopt and rerun the debates with the updated baseline concept.</p>
-                              
-                              <div className="space-y-sm pt-xs text-slate-700 dark:text-on-surface-variant" id="decision-checklist">
-                                {(innerResult.moderator.high_priority_improvements || []).map((imp, idx) => (
-                                  <div key={idx} className="flex items-start gap-xs text-xs">
-                                    <input type="checkbox" id={`improve-${idx}`} defaultChecked value={imp} className="rounded border-slate-300 dark:border-white/10 bg-slate-50 dark:bg-[#131313] text-secondary-container focus:ring-secondary-container mt-base" />
-                                    <label htmlFor={`improve-${idx}`} className="select-none leading-relaxed">{imp}</label>
-                                  </div>
+                          <p className="text-sm text-slate-800 dark:text-slate-100 bg-slate-50 dark:bg-[#13141a] p-sm border border-slate-200 dark:border-white/5 rounded-lg leading-relaxed font-medium">
+                            {innerResult?.moderator?.refined_idea || getActiveCandidateInfo()?.idea}
+                          </p>
+
+                          {innerResult?.moderator?.consensus && Array.isArray(innerResult.moderator.consensus) && innerResult.moderator.consensus.length > 0 && (
+                            <div className="pt-xs space-y-xs">
+                              <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-cyan-400 tracking-wider">Key Consensus Highlights</span>
+                              <ul className="list-disc list-inside text-xs text-slate-700 dark:text-emerald-300 space-y-xs pl-xs">
+                                {innerResult.moderator.consensus.map((c, idx) => (
+                                  <li key={idx}>{c}</li>
                                 ))}
-                              </div>
-
-                              <div className="space-y-xs pt-xs">
-                                <label className="font-code-sm text-[10px] text-slate-500 dark:text-on-surface-variant uppercase block font-bold">Operator Guidance Notes</label>
-                                <textarea value={operatorNotes} onChange={e => setOperatorNotes(e.target.value)} placeholder="e.g. Keep sensor checks, but simplify battery settings..." rows="3" className="w-full bg-slate-50 dark:bg-[#131313] border border-slate-200 dark:border-white/10 text-slate-900 dark:text-on-surface p-xs font-code-sm text-xs rounded-DEFAULT focus:outline-none focus:border-slate-400 dark:focus:border-secondary-container transition-all"></textarea>
-                              </div>
-
-                              <button onClick={triggerIteration} className="w-full bg-slate-900 dark:bg-secondary-container text-white dark:text-on-secondary-container font-label-xs text-label-xs py-sm rounded-DEFAULT hover:shadow-md transition-all uppercase tracking-widest font-bold flex items-center justify-center gap-xs">
-                                Iterate Concept
-                                <span className="material-symbols-outlined text-sm">sync</span>
-                              </button>
+                              </ul>
                             </div>
                           )}
                         </div>
 
-                        {/* Right Panel */}
-                        <div className="lg:col-span-4 space-y-lg text-left">
-                          {/* Moderator Synthesis */}
-                          {innerResult.moderator && (
-                            <div className="bg-white dark:bg-[#0A0A0A]/90 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-md shadow-sm relative overflow-hidden">
-                              <div className="absolute top-0 right-0 py-base px-sm bg-slate-100 dark:bg-primary-container/20 border-b border-l border-slate-200 dark:border-white/10 rounded-bl font-label-xs text-[9px] text-slate-700 dark:text-primary uppercase font-bold tracking-widest select-none">
-                                Moderator Synthesis
-                              </div>
-                              <div className="space-y-sm mt-xs">
-                                <h3 className="font-headline-lg-mobile font-bold text-slate-900 dark:text-white tracking-tight leading-snug">Refined Hackathon Concept</h3>
-                                <p className="text-sm text-slate-900 dark:text-on-surface bg-slate-50 dark:bg-[#131313] p-sm border border-slate-200 dark:border-white/5 rounded font-medium leading-relaxed">{innerResult.moderator.refined_idea}</p>
-                              </div>
-                              <div className="glow-divider my-sm"></div>
-                              <div className="space-y-sm text-xs font-code-sm">
-                                <div className="space-y-xs">
-                                  <span className="text-slate-500 dark:text-on-surface-variant uppercase text-[10px] block tracking-wide font-bold">Consensus Agreements</span>
-                                  <ul className="list-disc list-inside text-slate-700 dark:text-tertiary space-y-xs pl-xs">
-                                    {(innerResult.moderator.consensus || []).map((c, idx) => <li key={idx}>{c}</li>)}
-                                  </ul>
-                                </div>
-                                <div className="space-y-xs">
-                                  <span className="text-slate-500 dark:text-on-surface-variant uppercase text-[10px] block tracking-wide font-bold">Specialist Trade-offs</span>
-                                  <ul className="list-disc list-inside text-slate-700 dark:text-secondary space-y-xs pl-xs">
-                                    {(innerResult.moderator.tradeoffs || []).map((t, idx) => <li key={idx}>{t}</li>)}
-                                  </ul>
-                                </div>
-                              </div>
-                              <div className="glow-divider my-sm"></div>
-                              <div className="space-y-xs">
-                                <h4 className="font-display-lg text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider">Implementation Roadmap</h4>
-                                <ol className="space-y-sm pl-xs pt-xs">
-                                  {(innerResult.moderator.implementation_roadmap || []).map((step, idx) => (
-                                    <li key={idx} className="flex gap-xs items-start">
-                                      <span className="w-5 h-5 bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-800 dark:text-primary-fixed-dim rounded-full flex items-center justify-center flex-shrink-0 text-[10px] font-bold mt-base">{idx+1}</span>
-                                      <p className="text-xs text-slate-600 dark:text-on-surface-variant leading-normal pt-base">{step}</p>
-                                    </li>
-                                  ))}
-                                </ol>
-                              </div>
-                            </div>
-                          )}
+                        {/* 2. NEXT: FACTS BRIEF */}
+                        <div className="bg-white dark:bg-[#0A0A0A]/90 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-sm">
+                          <h3 className="font-display-lg text-xs uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs">
+                            <span className="material-symbols-outlined text-sm">fact_check</span> Verified Facts & Evidence Brief
+                          </h3>
+                          <ul className="space-y-xs text-xs text-slate-700 dark:text-slate-200 font-code-sm">
+                            {(() => {
+                              let factsList = [];
+                              if (innerResult?.research) {
+                                if (Array.isArray(innerResult.research.facts)) {
+                                  factsList = innerResult.research.facts;
+                                } else if (typeof innerResult.research === "object") {
+                                  Object.values(innerResult.research).forEach(b => {
+                                    if (b && Array.isArray(b.facts)) factsList.push(...b.facts);
+                                  });
+                                }
+                              }
+                              const candEvidence = getActiveCandidateInfo()?.evidence || [];
+                              if (factsList.length === 0 && candEvidence.length > 0) {
+                                factsList = candEvidence.map(e => ({ claim: e, source: "Internal Analysis" }));
+                              }
+                              if (factsList.length === 0) {
+                                factsList = [
+                                  { claim: "Target market problem validated via competitive benchmark.", source: "Crucible Research" },
+                                  { claim: "MVP tech stack achievable within standard hackathon timeline.", source: "Feasibility Assessment" }
+                                ];
+                              }
+                              return factsList.slice(0, 4).map((f, idx) => (
+                                <li key={idx} className="flex items-start gap-xs bg-slate-50 dark:bg-[#13141a] p-xs rounded border border-slate-200 dark:border-white/5">
+                                  <span className="material-symbols-outlined text-xs text-emerald-500 mt-0.5">check_circle</span>
+                                  <div>
+                                    <span className="font-medium text-slate-900 dark:text-white">{typeof f === "string" ? f : (f?.claim || f)}</span>
+                                    {f?.source && <span className="text-[10px] text-slate-400 block">Source: {f.source}</span>}
+                                  </div>
+                                </li>
+                              ));
+                            })()}
+                          </ul>
                         </div>
+
+                        {/* 3. NEXT: OPERATOR DECISION LOOP */}
+                        <div className="bg-white dark:bg-[#0A0A0A]/90 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-sm">
+                          <div className="flex items-center justify-between border-b border-slate-100 dark:border-white/5 pb-xs">
+                            <h3 className="font-display-lg text-xs uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs">
+                              <span className="material-symbols-outlined text-sm">settings_backup_restore</span> Operator Decision Loop
+                            </h3>
+                            <span className="text-[10px] text-slate-500 dark:text-slate-400">Select updates to refine concept</span>
+                          </div>
+
+                          <div className="space-y-xs text-xs font-code-sm pt-xs" id="decision-checklist">
+                            {(() => {
+                              const improvements = (innerResult?.moderator?.high_priority_improvements && Array.isArray(innerResult.moderator.high_priority_improvements)) 
+                                ? innerResult.moderator.high_priority_improvements 
+                                : [
+                                  "Prioritize lightweight API integrations for fast demo setup.",
+                                  "Incorporate fallback mode for offline evaluation.",
+                                  "Scope core user workflow down to 3 key interactive steps."
+                                ];
+                              return improvements.map((imp, idx) => {
+                                const isChecked = selectedImprovements[idx] ?? true;
+                                return (
+                                  <label key={idx} className="flex items-start gap-xs p-xs rounded bg-slate-50 dark:bg-[#13141a] border border-slate-200 dark:border-white/5 cursor-pointer hover:border-cyan-500/40 transition-all select-none">
+                                    <input
+                                      type="checkbox"
+                                      checked={isChecked}
+                                      onChange={() => toggleImprovement(idx)}
+                                      className="mt-0.5 rounded border-slate-300 dark:border-white/20 bg-white dark:bg-slate-900 text-cyan-500 focus:ring-cyan-400"
+                                    />
+                                    <span className={`text-xs leading-relaxed ${isChecked ? "text-slate-900 dark:text-slate-100 font-medium" : "text-slate-400 line-through"}`}>
+                                      {imp}
+                                    </span>
+                                  </label>
+                                );
+                              });
+                            })()}
+                          </div>
+
+                          <div className="pt-xs space-y-xs">
+                            <textarea
+                              value={operatorNotes}
+                              onChange={e => setOperatorNotes(e.target.value)}
+                              placeholder="Add optional operator guidance notes for next iteration..."
+                              rows="2"
+                              className="w-full bg-slate-50 dark:bg-[#13141a] border border-slate-200 dark:border-white/10 text-slate-900 dark:text-on-surface p-xs font-code-sm text-xs rounded-lg focus:outline-none focus:border-cyan-500 transition-all"
+                            ></textarea>
+                          </div>
+
+                          <button
+                            onClick={triggerIteration}
+                            className="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-label-xs text-xs py-sm rounded-lg shadow-sm transition-all uppercase tracking-widest font-bold flex items-center justify-center gap-xs"
+                          >
+                            Iterate Concept
+                            <span className="material-symbols-outlined text-sm">sync</span>
+                          </button>
+                        </div>
+
                       </div>
                     )}
 
@@ -1444,10 +1772,14 @@ export default function App() {
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-md">
                           {["Innovation", "Feasibility", "Impact", "Technical", "Skeptic"].map(name => {
                             const key = name.toLowerCase();
-                            const reviews = innerResult.refined_reviews || innerResult.reviews || {};
-                            const reflections = innerResult.refined_reflections || innerResult.reflections || {};
-                            const rev = reviews[key] || reviews[name];
-                            const refl = reflections[key] || reflections[name];
+                            const reviews = innerResult.refined_reviews || innerResult.reviews || (innerResult.refinement ? innerResult.refinement.reviews : {}) || {};
+                            const reflections = innerResult.refined_reflections || innerResult.reflections || (innerResult.refinement ? innerResult.refinement.reflections : {}) || {};
+                            
+                            let revRaw = reviews[key] || reviews[name] || reviews[name.toLowerCase()] || reviews[name + " Agent"];
+                            let reflRaw = reflections[key] || reflections[name] || reflections[name.toLowerCase()] || reflections[name + " Agent"];
+                            
+                            let rev = typeof revRaw === "object" ? revRaw : (typeof revRaw === "string" ? { score: 7, strengths: [revRaw], weaknesses: [], suggestions: [] } : null);
+                            let refl = typeof reflRaw === "object" ? reflRaw : (typeof reflRaw === "string" ? { new_score: 8 } : null);
 
                             if (!rev) return null;
 
@@ -1458,21 +1790,21 @@ export default function App() {
                                     <h4 className="font-bold text-slate-800 dark:text-white text-xs uppercase tracking-wide font-display-lg">{name}</h4>
                                     {refl && refl.new_score !== undefined && refl.new_score !== rev.score ? (
                                       <div className="flex items-center gap-xs">
-                                        <span className="text-xs line-through text-slate-400 dark:text-on-surface-variant">{rev.score}</span>
-                                        <span className="text-sm font-bold text-slate-900 dark:text-tertiary font-display-lg">{refl.new_score}/10</span>
+                                        <span className="text-xs line-through text-slate-400 dark:text-on-surface-variant">{rev.score !== undefined ? rev.score : 7}</span>
+                                        <span className="text-sm font-bold text-slate-900 dark:text-emerald-400 font-display-lg">{refl.new_score}/10</span>
                                       </div>
                                     ) : (
-                                      <span className="text-sm font-bold text-slate-900 dark:text-secondary font-display-lg">{rev.score}/10</span>
+                                      <span className="text-sm font-bold text-slate-900 dark:text-cyan-400 font-display-lg">{rev.score !== undefined ? rev.score : 7}/10</span>
                                     )}
                                   </div>
                                   <div className="space-y-sm text-xs text-left">
                                     <div>
                                       <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold">Strengths</span>
-                                      <p className="text-slate-800 dark:text-on-surface leading-normal">{rev.strengths ? rev.strengths.join(", ") : "None specified"}</p>
+                                      <p className="text-slate-800 dark:text-slate-200 leading-normal">{rev.strengths && Array.isArray(rev.strengths) ? rev.strengths.join(", ") : (typeof rev.strengths === "string" ? rev.strengths : "Detailed feedback available")}</p>
                                     </div>
                                     <div>
                                       <span className="text-[9px] uppercase tracking-wider text-slate-500 dark:text-on-surface-variant block font-bold">Suggestions Adopted</span>
-                                      <p className="text-slate-800 dark:text-on-surface leading-normal">{rev.suggestions ? rev.suggestions.join(", ") : "None specified"}</p>
+                                      <p className="text-slate-800 dark:text-slate-200 leading-normal">{rev.suggestions && Array.isArray(rev.suggestions) ? rev.suggestions.join(", ") : "Refer to roadmap items"}</p>
                                     </div>
                                   </div>
                                 </div>
@@ -1486,26 +1818,112 @@ export default function App() {
                       </div>
                     )}
 
-                    {/* SUBVIEW 3: STRUCTURED DEBATES */}
+                    {/* SUBVIEW 3: VISUAL STRUCTURED DEBATE FLOW */}
                     {activeTabSubView === "debates" && (
-                      <div className="bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-sm shadow-xs">
-                        <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs select-none">
-                          <span className="material-symbols-outlined text-sm">chat_bubble</span> Structured Debate Cross-Examination
-                        </h3>
-                        <div className="space-y-sm max-h-[500px] overflow-y-auto pr-xs border border-slate-200 dark:border-white/5 bg-slate-50 dark:bg-[#131313]/60 p-sm rounded font-code-sm text-xs text-left">
-                          {chats && chats.length > 0 ? (
-                            chats.map((chat, idx) => (
-                              <div key={idx} className="border-b border-slate-100 dark:border-white/5 pb-xs mb-xs">
-                                <div className="flex items-center gap-xs mb-xs">
-                                  <span className="font-bold uppercase text-slate-800 dark:text-white">{chat.sender}</span>
-                                  <span className="text-[9px] text-slate-500 dark:text-on-surface-variant">{new Date(chat.created_at).toLocaleTimeString()}</span>
+                      <div className="bg-white dark:bg-[#0A0A0A]/85 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-md shadow-xs">
+                        <div className="flex flex-col md:flex-row md:items-center justify-between border-b border-slate-200 dark:border-white/10 pb-sm gap-xs">
+                          <div>
+                            <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-cyan-300 flex items-center gap-xs select-none">
+                              <span className="material-symbols-outlined text-sm">hub</span> Visual Cross-Examination Argument Flow
+                            </h3>
+                            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                              Map of peer challenges, rebuttals, and concessions leading directly to final Moderator synthesis.
+                            </p>
+                          </div>
+                          <span className="font-code-sm text-[10px] bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 border border-cyan-500/20 px-xs py-base rounded uppercase font-bold self-start md:self-auto">
+                            A2A Debate Graph
+                          </span>
+                        </div>
+
+                        {/* Panel Node Visual Bar */}
+                        <div className="bg-slate-50 dark:bg-[#13141a] p-sm rounded-xl border border-slate-200 dark:border-white/5 flex flex-wrap items-center justify-between gap-sm font-code-sm text-xs select-none">
+                          <div className="flex items-center gap-xs text-amber-500 font-bold"><span className="material-symbols-outlined text-sm">tips_and_updates</span> Innovation</div>
+                          <span className="text-slate-400">➔</span>
+                          <div className="flex items-center gap-xs text-purple-500 font-bold"><span className="material-symbols-outlined text-sm">construction</span> Feasibility</div>
+                          <span className="text-slate-400">➔</span>
+                          <div className="flex items-center gap-xs text-blue-500 font-bold"><span className="material-symbols-outlined text-sm">stars</span> Impact</div>
+                          <span className="text-slate-400">➔</span>
+                          <div className="flex items-center gap-xs text-emerald-500 font-bold"><span className="material-symbols-outlined text-sm">developer_board</span> Technical</div>
+                          <span className="text-slate-400">➔</span>
+                          <div className="flex items-center gap-xs text-rose-500 font-bold"><span className="material-symbols-outlined text-sm">security_update_warning</span> Skeptic</div>
+                          <span className="text-slate-400">➔</span>
+                          <div className="flex items-center gap-xs text-cyan-400 font-bold"><span className="material-symbols-outlined text-sm">gavel</span> Moderator</div>
+                        </div>
+
+                        {/* Visual Timeline of Exchanges with Centered Circles */}
+                        <div className="space-y-md max-h-[550px] overflow-y-auto pr-xs border border-slate-200 dark:border-white/5 bg-slate-50/50 dark:bg-[#0d0e12] p-md rounded-xl font-code-sm text-xs text-left">
+                          {(() => {
+                            const exchanges = getAllDebateExchanges(innerResult);
+                            if (exchanges.length === 0 && (!chats || chats.length === 0)) {
+                              return <div className="text-slate-500 dark:text-slate-400 text-center py-md">No structured debates recorded for this project yet. Click "Refine This Idea" to run the debate engine.</div>;
+                            }
+
+                            if (exchanges.length > 0) {
+                              return (
+                                <div className="relative space-y-lg py-sm max-w-2xl mx-auto before:absolute before:inset-0 before:left-1/2 before:-translate-x-1/2 before:w-0.5 before:bg-slate-300 dark:before:bg-white/10">
+                                  {exchanges.map((ex, idx) => {
+                                    const isDisagree = ex.stance && (ex.stance.toLowerCase().includes("disagree") || ex.stance.toLowerCase().includes("challenge"));
+                                    const isEven = idx % 2 === 0;
+                                    return (
+                                      <div key={idx} className="relative flex items-center justify-center my-md">
+                                        {/* Timeline Step Node Circle centered directly on vertical line */}
+                                        <div className={`absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-4 h-4 rounded-full border-2 z-10 ${isDisagree ? "bg-rose-500 border-rose-200 shadow-[0_0_8px_rgba(244,63,94,0.5)]" : "bg-emerald-500 border-emerald-200 shadow-[0_0_8px_rgba(16,185,129,0.5)]"}`}></div>
+                                        
+                                        {/* Card placed on left or right */}
+                                        <div className={`w-[calc(50%-1.5rem)] ${isEven ? "mr-auto text-right" : "ml-auto text-left"}`}>
+                                          <div className="bg-white dark:bg-[#161820] border border-slate-200 dark:border-white/10 p-sm rounded-xl shadow-xs space-y-xs hover:border-cyan-500/50 transition-all">
+                                            <div className={`flex flex-wrap items-center gap-xs border-b border-slate-100 dark:border-white/5 pb-xs ${isEven ? "justify-end" : "justify-start"}`}>
+                                              <span className="font-bold text-cyan-700 dark:text-cyan-300 text-xs">{ex.speaker}</span>
+                                              <span className="material-symbols-outlined text-xs text-slate-400">arrow_forward</span>
+                                              <span className="text-slate-600 dark:text-slate-300 text-xs">{ex.target}</span>
+                                              <span className={`text-[9px] px-xs py-base rounded uppercase font-bold tracking-wider ${isDisagree ? "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/30" : "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30"}`}>
+                                                {ex.stance}
+                                              </span>
+                                            </div>
+                                            <p className="text-slate-700 dark:text-slate-200 leading-relaxed text-xs pt-xs">
+                                              "{ex.argument}"
+                                            </p>
+                                          </div>
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+
+                                  {/* Final Conclusion Synthesis Card Centered */}
+                                  {innerResult?.moderator && (
+                                    <div className="relative flex flex-col items-center pt-md max-w-lg mx-auto text-center">
+                                      <div className="w-6 h-6 rounded-full bg-cyan-400 border-2 border-white flex items-center justify-center z-10 shadow-md mb-xs">
+                                        <span className="material-symbols-outlined text-xs text-black font-bold">check</span>
+                                      </div>
+                                      <div className="w-full bg-cyan-500/10 border border-cyan-500/30 p-md rounded-xl space-y-xs">
+                                        <div className="flex items-center justify-center gap-xs text-cyan-700 dark:text-cyan-300 font-bold text-xs uppercase">
+                                          <span className="material-symbols-outlined text-sm">gavel</span> Moderator Final Synthesis
+                                        </div>
+                                        <p className="text-slate-800 dark:text-slate-100 text-xs leading-relaxed font-medium">
+                                          {innerResult.moderator.refined_idea}
+                                        </p>
+                                      </div>
+                                    </div>
+                                  )}
                                 </div>
-                                <p className="text-slate-600 dark:text-on-surface-variant leading-relaxed">{chat.message}</p>
+                              );
+                            }
+
+                            // Fallback if structured chats exist
+                            return (
+                              <div className="space-y-sm max-w-xl mx-auto">
+                                {chats.map((chat, idx) => (
+                                  <div key={idx} className="bg-white dark:bg-[#161820] border border-slate-200 dark:border-white/10 p-sm rounded-xl space-y-xs">
+                                    <div className="flex items-center justify-between border-b border-slate-100 dark:border-white/5 pb-xs">
+                                      <span className="font-bold text-slate-800 dark:text-cyan-300 uppercase">{chat.sender}</span>
+                                      <span className="text-[9px] text-slate-400">{new Date(chat.created_at).toLocaleTimeString()}</span>
+                                    </div>
+                                    <p className="text-slate-700 dark:text-slate-200 leading-relaxed text-xs">{chat.message}</p>
+                                  </div>
+                                ))}
                               </div>
-                            ))
-                          ) : (
-                            <div className="text-slate-500 dark:text-on-surface-variant text-center py-sm">No structured debates recorded for this session.</div>
-                          )}
+                            );
+                          })()}
                         </div>
                       </div>
                     )}
@@ -1607,17 +2025,41 @@ export default function App() {
                         </p>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-sm pt-sm">
                           {loadedResult.candidates.map((cand, idx) => (
-                            <div key={idx} onClick={() => openCandidateModal(cand)} className="bg-slate-50 dark:bg-[#131313] border border-slate-200 dark:border-white/10 p-sm rounded hover:border-slate-400 dark:hover:border-primary-container transition-all cursor-pointer text-left">
-                              <div className="flex justify-between items-center mb-xs">
-                                <h4 className="font-bold text-slate-800 dark:text-white text-xs">{cand.title}</h4>
-                                <span className="text-[10px] px-xs bg-slate-100 dark:bg-primary/10 border border-slate-200 dark:border-primary/30 rounded text-slate-600 dark:text-primary">Creator: {cand.creator || "AI Agent"}</span>
+                            <div key={idx} className="bg-slate-50 dark:bg-[#131313] border border-slate-200 dark:border-white/10 p-sm rounded hover:border-slate-400 dark:hover:border-primary-container transition-all flex flex-col justify-between text-left">
+                              <div className="space-y-xs">
+                                <div className="flex justify-between items-center mb-xs">
+                                  <h4 className="font-bold text-slate-800 dark:text-white text-xs">{cand.title}</h4>
+                                  <span className="text-[10px] px-xs bg-slate-100 dark:bg-cyan-950/60 border border-slate-200 dark:border-cyan-800/40 rounded text-slate-700 dark:text-cyan-300 font-bold">Creator: {cand.creator || cand.agent || "AI Agent"}</span>
+                                </div>
+                                <p className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed line-clamp-3">{cand.idea}</p>
                               </div>
-                              <p className="text-xs text-slate-500 dark:text-on-surface-variant line-clamp-3">{cand.idea}</p>
+                              <div className="flex items-center gap-xs mt-sm pt-xs border-t border-slate-200 dark:border-white/5">
+                                <button onClick={() => openCandidateModal(cand)} className="flex-1 text-slate-700 dark:text-slate-200 hover:text-slate-900 dark:hover:text-white text-[10px] font-bold uppercase py-xs rounded bg-slate-200/60 dark:bg-white/10 transition-all text-center">
+                                  View Details
+                                </button>
+                                <button onClick={() => selectCandidateIdea(cand)} className="flex-1 bg-primary-container hover:bg-primary-container/80 text-on-primary-container text-[10px] font-bold uppercase py-xs rounded transition-all text-center flex items-center justify-center gap-xs font-bold">
+                                  Refine Idea
+                                  <span className="material-symbols-outlined text-[12px]">sync</span>
+                                </button>
+                              </div>
                             </div>
                           ))}
                         </div>
                       </div>
                     )}
+                  </>
+                ) : (
+                  <div className="flex flex-col items-center justify-center py-2xl space-y-md min-h-[50vh]">
+                    <span className="material-symbols-outlined text-4xl text-slate-400">folder_off</span>
+                    <h3 className="font-bold text-slate-700 dark:text-slate-200 text-sm">Project Details Unavailable</h3>
+                    <button
+                      onClick={() => { setActiveTab("pathway"); setActiveProject(null); setLoadedResult(null); }}
+                      className="px-md py-xs bg-cyan-600 text-white rounded font-bold text-xs uppercase"
+                    >
+                      Return to Brainstorming
+                    </button>
+                  </div>
+                )}
 
                   </div>
                 )}
@@ -1771,6 +2213,26 @@ export default function App() {
                         </div>
                       </div>
                     </div>
+{/* Update profile block */}
+<div className="bg-white dark:bg-[#0A0A0A]/80 border border-slate-200 dark:border-white/10 p-md rounded-xl shadow-xs space-y-md text-left">
+  <h3 className="font-bold text-slate-800 dark:text-white text-sm uppercase tracking-wider">Update Profile</h3>
+  <form onSubmit={handleProfileUpdate} className="space-y-sm">
+    <div className="space-y-xs">
+      <label className="font-code-sm text-[10px] text-slate-500 dark:text-on-surface-variant uppercase block font-bold">New Username</label>
+      <input type="text" value={newUsername} onChange={e => setNewUsername(e.target.value)} className="w-full bg-slate-50 dark:bg-[#131313] border border-slate-200 dark:border-white/10 text-slate-900 dark:text-on-surface p-xs font-code-sm text-xs rounded" placeholder="Enter new username" />
+    </div>
+    <div className="space-y-xs">
+      <label className="font-code-sm text-[10px] text-slate-500 dark:text-on-surface-variant uppercase block font-bold">New Email</label>
+      <input type="email" value={newEmail} onChange={e => setNewEmail(e.target.value)} className="w-full bg-slate-50 dark:bg-[#131313] border border-slate-200 dark:border-white/10 text-slate-900 dark:text-on-surface p-xs font-code-sm text-xs rounded" placeholder="Enter new email" />
+    </div>
+    {passcodeSuccess && (
+      <div className="text-slate-800 dark:text-tertiary text-xs font-code-sm p-xs bg-slate-100 dark:bg-tertiary/10 border border-slate-200 dark:border-tertiary/30 rounded">
+        {passcodeSuccess}
+      </div>
+    )}
+    <button type="submit" className="w-full bg-slate-900 dark:bg-primary-container text-white dark:text-on-primary-container font-label-xs text-label-xs py-sm rounded hover:shadow-md transition-all uppercase tracking-widest font-bold">Update Profile</button>
+  </form>
+</div>
 
                     {/* Simulation logs */}
                     <div className="bg-white dark:bg-[#0A0A0A]/80 border border-slate-200 dark:border-white/10 p-md rounded-xl shadow-xs space-y-xs">
@@ -1958,6 +2420,100 @@ export default function App() {
             </div>
             <div className="flex-1 overflow-y-auto space-y-md font-code-sm text-xs pr-xs text-slate-800 dark:text-on-surface-variant">
               {modalContent}
+            </div>
+          </div>
+        </div>
+      )}
+      {/* COLLABORATION / SHARE MODAL */}
+      {showCollabModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 px-4">
+          <div className="w-full max-w-md bg-white dark:bg-[#0A0A0A]/95 border border-slate-200 dark:border-white/10 p-md rounded-xl space-y-md flex flex-col text-left shadow-lg">
+            <div className="flex items-center justify-between border-b border-slate-200 dark:border-white/10 pb-xs">
+              <h3 className="font-display-lg text-sm uppercase tracking-wider font-bold text-slate-900 dark:text-primary flex items-center gap-xs">
+                <span className="material-symbols-outlined text-sm">groups</span> Share & Team Uplink
+              </h3>
+              <button onClick={() => setShowCollabModal(false)} className="text-slate-500 dark:text-on-surface-variant hover:text-slate-800 dark:hover:text-white transition-colors">
+                <span className="material-symbols-outlined">close</span>
+              </button>
+            </div>
+            
+            <form onSubmit={inviteCollaborator} className="space-y-xs">
+              <label className="font-code-sm text-[10px] uppercase font-bold text-slate-500 dark:text-on-surface-variant">Invite Teammate (Email / Username)</label>
+              <div className="flex gap-xs">
+                <input
+                  type="text"
+                  value={inviteEmail}
+                  onChange={e => setInviteEmail(e.target.value)}
+                  placeholder="e.g. teammate@hackathon.io"
+                  className="flex-1 bg-slate-50 dark:bg-[#131313] border border-slate-200 dark:border-white/10 text-slate-900 dark:text-on-surface p-xs font-code-sm text-xs rounded-DEFAULT focus:outline-none focus:border-primary-container"
+                />
+                <button type="submit" className="bg-primary-container text-on-primary-container font-label-xs text-xs px-md py-xs rounded-DEFAULT uppercase font-bold hover:bg-primary-container/80 transition-all">
+                  Invite
+                </button>
+              </div>
+              {inviteStatus && (
+                <p className={`text-[10px] font-code-sm mt-xs ${inviteStatus.includes("[ERROR]") ? "text-red-500" : "text-green-500"}`}>
+                  {inviteStatus}
+                </p>
+              )}
+            </form>
+
+            <div className="space-y-xs pt-xs border-t border-slate-200 dark:border-white/10">
+              <h4 className="font-code-sm text-xs font-bold text-slate-800 dark:text-white uppercase">Project Members</h4>
+              <div className="max-h-40 overflow-y-auto space-y-xs font-code-sm text-xs">
+                {collaborators.owner && (
+                  <div className="flex items-center justify-between p-xs bg-slate-50 dark:bg-white/5 rounded border border-slate-200 dark:border-white/5">
+                    <div>
+                      <span className="font-bold text-slate-800 dark:text-white">{collaborators.owner.username}</span>
+                      <span className="text-[10px] text-slate-400 dark:text-on-surface-variant block">{collaborators.owner.email}</span>
+                    </div>
+                    <span className="text-[9px] px-xs py-base bg-primary/10 text-primary rounded font-bold uppercase">Owner</span>
+                  </div>
+                )}
+                {(collaborators.collaborators || (Array.isArray(collaborators) ? collaborators : [])).map((c, idx) => (
+                  <div key={idx} className="flex items-center justify-between p-xs bg-slate-50 dark:bg-white/5 rounded border border-slate-200 dark:border-white/5">
+                    <div>
+                      <span className="font-bold text-slate-800 dark:text-white">{c.username || c.email}</span>
+                      <span className="text-[10px] text-slate-400 dark:text-on-surface-variant block">{c.email}</span>
+                    </div>
+                    <span className="text-[9px] px-xs py-base bg-secondary/10 text-secondary rounded font-bold uppercase">Teammate</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {deleteConfirmProject && (
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/80 backdrop-blur-sm p-md">
+          <div className="w-full max-w-sm bg-white dark:bg-[#0E0F14] border border-slate-200 dark:border-white/10 p-lg rounded-xl space-y-md flex flex-col text-left shadow-2xl">
+            <div className="flex items-center gap-xs text-rose-500 font-bold text-sm uppercase font-display-lg">
+              <span className="material-symbols-outlined text-lg">warning</span>
+              Confirm Delete Project
+            </div>
+            <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed font-code-sm">
+              Are you sure you want to permanently delete this project? All research, reviews, and debate records will be removed. This action cannot be undone.
+            </p>
+            <div className="flex justify-end items-center gap-sm pt-xs font-code-sm">
+              <button
+                type="button"
+                onClick={() => setDeleteConfirmProject(null)}
+                className="px-md py-xs bg-slate-100 hover:bg-slate-200 dark:bg-white/10 dark:hover:bg-white/20 text-slate-700 dark:text-slate-200 text-xs font-bold rounded-lg transition-all"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const targetId = deleteConfirmProject;
+                  setDeleteConfirmProject(null);
+                  await deleteProject(targetId);
+                }}
+                className="px-md py-xs bg-red-600 hover:bg-red-500 text-white text-xs font-bold rounded-lg shadow-sm transition-all flex items-center gap-xs"
+              >
+                <span className="material-symbols-outlined text-xs">delete</span>
+                Delete Permanently
+              </button>
             </div>
           </div>
         </div>

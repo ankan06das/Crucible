@@ -15,9 +15,17 @@ from pydantic import BaseModel
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT_DIR))
 
-from generator import generate_candidates, generate_idea
-from orchestrator import run_pipeline
-from schemas.generation import GenerationRequest, GenerationResult
+try:
+    from generator import generate_candidates, generate_idea
+    from orchestrator import run_pipeline
+    from schemas.generation import GenerationRequest, GenerationResult
+except ModuleNotFoundError:
+    # Optional modules not available; endpoints depending on them will raise an error if used.
+    generate_candidates = None
+    generate_idea = None
+    run_pipeline = None
+    GenerationRequest = None
+    GenerationResult = None
 
 DB_FILE = Path(__file__).parent / "crucible.db"
 
@@ -197,6 +205,44 @@ async def login(req: LoginRequest):
     }
 
 
+class UpdateUserRequest(BaseModel):
+    username: Optional[str] = None
+    email: Optional[str] = None
+
+@app.put("/api/user")
+async def update_user(req: UpdateUserRequest, authorization: str = Header(None)):
+    """Update the authenticated user's username and/or email.
+    Returns the updated username and email."""
+    user_id = get_user_id_from_header(authorization)
+    conn = sqlite3.connect(str(DB_FILE))
+    c = conn.cursor()
+    if req.username:
+        c.execute("SELECT id FROM users WHERE username = ? AND id != ?", (req.username, user_id))
+        if c.fetchone():
+            conn.close()
+            raise HTTPException(status_code=400, detail="Username already taken")
+    if req.email:
+        c.execute("SELECT id FROM users WHERE email = ? AND id != ?", (req.email, user_id))
+        if c.fetchone():
+            conn.close()
+            raise HTTPException(status_code=400, detail="Email already registered")
+    updates = []
+    params = []
+    if req.username:
+        updates.append("username = ?")
+        params.append(req.username)
+    if req.email:
+        updates.append("email = ?")
+        params.append(req.email)
+    params.append(user_id)
+    if updates:
+        c.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", tuple(params))
+        conn.commit()
+    c.execute("SELECT username, email FROM users WHERE id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return {"username": row[0], "email": row[1]}
+
 # Project Endpoints
 @app.get("/api/projects")
 async def get_projects(user_id: str = Header(None, alias="Authorization")):
@@ -238,6 +284,33 @@ async def get_project(project_id: str, user_id: str = Header(None, alias="Author
         "project_data": project_data,
         "owner_id": row[4],
     }
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str, user_id: str = Header(None, alias="Authorization")):
+    resolved_user_id = get_user_id_from_header(user_id)
+    conn = sqlite3.connect(str(DB_FILE))
+    c = conn.cursor()
+    # Verify owner or collaborator
+    c.execute("""
+        SELECT p.id 
+        FROM projects p
+        LEFT JOIN project_collaborators pc ON p.id = pc.project_id
+        WHERE p.id = ? AND (p.user_id = ? OR pc.user_id = ?)
+    """, (project_id, resolved_user_id, resolved_user_id))
+    if not c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=403, detail="Access denied or project not found")
+
+    # Delete related chats
+    c.execute("DELETE FROM chats WHERE project_id = ?", (project_id,))
+    # Delete collaborators
+    c.execute("DELETE FROM project_collaborators WHERE project_id = ?", (project_id,))
+    # Delete the project itself
+    c.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    conn.commit()
+    conn.close()
+    return {"detail": "Project deleted successfully"}
 
 
 @app.get("/api/projects/{project_id}/chats")
