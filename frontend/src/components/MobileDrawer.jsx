@@ -72,7 +72,7 @@ export default function MobileDrawer() {
         </div>
 
         <div className="mb-6">
-          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Shared with you</h3>
+          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Collaborations</h3>
           <div className="space-y-1">
             {collaboratedProjects.length === 0 && <p className="text-sm italic text-slate-400">Nothing shared yet.</p>}
             {collaboratedProjects.map((proj) => (
@@ -81,7 +81,7 @@ export default function MobileDrawer() {
                 onClick={() => { loadProjectDetails(proj.id); setMobileMenuOpen(false); }}
                 className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-slate-600 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-[#1a1e2b]"
               >
-                <span className="material-symbols-outlined text-base text-slate-400">groups</span>
+                <span className="material-symbols-outlined text-base text-slate-400">folder</span>
                 <span className="truncate">{proj.name}</span>
               </button>
             ))}

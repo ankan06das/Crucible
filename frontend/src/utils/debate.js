@@ -58,7 +58,7 @@ export function buildIdeasFromData(pd) {
   if (Array.isArray(pd.candidates)) {
     pd.candidates.forEach((cand, idx) => {
       const title = cand?.title || "";
-      ideas.push({ type: "candidate", idx, label: `Idea #${idx + 1}: ${title}`, title });
+      ideas.push({ type: "candidate", idx, label: `Idea #${idx + 1}: ${title}`, title, versions: cand.versions });
     });
   }
   if (Array.isArray(pd.versions)) {
