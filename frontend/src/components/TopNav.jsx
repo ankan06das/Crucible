@@ -19,6 +19,10 @@ export default function TopNav() {
     <nav className="sticky top-0 z-40 border-b border-slate-200 dark:border-[#272c3d] bg-white/90 backdrop-blur dark:bg-[#0e1018]/90">
       <div className="mx-auto flex h-14 max-w-7xl items-center justify-between gap-4 px-4">
         <div className="flex items-center gap-3">
+          <button onClick={goToPathway} className="flex items-center gap-2">
+            <img src="/favicon.png" className="h-6 w-6 rounded-full" alt="Crucible logo" />
+            <span className="bg-gradient-to-r from-indigo-600 via-violet-600 to-fuchsia-500 bg-clip-text text-lg font-bold tracking-tight text-transparent dark:from-indigo-400 dark:via-violet-400 dark:to-fuchsia-400">Crucible.</span>
+          </button>
           {isBrainstormTab && (
             <button
               onClick={() => setMobileMenuOpen(true)}
@@ -27,10 +31,6 @@ export default function TopNav() {
               <span className="material-symbols-outlined">menu</span>
             </button>
           )}
-          <button onClick={goToPathway} className="flex items-center gap-2">
-            <img src="/favicon.png" className="h-6 w-6 rounded-full" alt="Crucible logo" />
-            <span className="bg-gradient-to-r from-indigo-600 via-violet-600 to-fuchsia-500 bg-clip-text text-lg font-bold tracking-tight text-transparent dark:from-indigo-400 dark:via-violet-400 dark:to-fuchsia-400">Crucible.</span>
-          </button>
           <span className="hidden h-5 w-px bg-slate-200 dark:bg-[#272c3d] md:block" />
           <button
             onClick={goToPathway}
@@ -41,6 +41,26 @@ export default function TopNav() {
             }`}
           >
             Brainstorm
+          </button>
+          <button
+            onClick={() => setActiveTab("about")}
+            className={`hidden rounded-md px-2.5 py-1.5 text-sm font-medium md:inline-flex ${
+              activeTab === "about"
+                ? "bg-slate-100 text-slate-900 dark:bg-indigo-500/10 dark:text-indigo-300"
+                : "text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white"
+            }`}
+          >
+            About
+          </button>
+          <button
+            onClick={() => setActiveTab("contact")}
+            className={`hidden rounded-md px-2.5 py-1.5 text-sm font-medium md:inline-flex ${
+              activeTab === "contact"
+                ? "bg-slate-100 text-slate-900 dark:bg-indigo-500/10 dark:text-indigo-300"
+                : "text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white"
+            }`}
+          >
+            Contact
           </button>
         </div>
 
@@ -70,8 +90,6 @@ export default function TopNav() {
                 <div className="absolute right-0 z-20 mt-1 w-44 rounded-lg border border-slate-200 bg-white p-1 shadow-lg dark:border-[#272c3d] dark:bg-[#1a1e2b]">
                   {[
                     { id: "profile", label: "Profile", icon: "person" },
-                    { id: "about", label: "About", icon: "info" },
-                    { id: "contact", label: "Contact", icon: "mail" },
                   ].map((item) => (
                     <button
                       key={item.id}
